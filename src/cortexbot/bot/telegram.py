@@ -9,7 +9,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from cortexbot.config import BotConfig
 from cortexbot.events.bus import EventBus
-from cortexbot.bot.commands import task_command, cancel_command
+from cortexbot.bot.commands import (
+    task_command,
+    status_command,
+    continue_command,
+    skip_command,
+    retry_command,
+    cancel_command,
+    tasks_command,
+    budget_command,
+)
 from cortexbot.orchestrator.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -40,7 +49,13 @@ def create_application(config: BotConfig, event_bus: EventBus) -> Application:
     # Register commands
     app.add_handler(CommandHandler("ping", _ping))
     app.add_handler(CommandHandler("task", task_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("continue", continue_command))
+    app.add_handler(CommandHandler("skip", skip_command))
+    app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("tasks", tasks_command))
+    app.add_handler(CommandHandler("budget", budget_command))
 
     logger.info("Telegram application created for group %s", config.telegram.group_id)
     return app

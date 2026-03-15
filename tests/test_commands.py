@@ -2,7 +2,7 @@
 
 import pytest
 
-from cortexbot.bot.commands import parse_task_args
+from cortexbot.bot.commands import parse_task_args, parse_skip_args
 
 
 class TestParseTaskArgs:
@@ -43,3 +43,21 @@ class TestParseTaskArgs:
         """Only flags and no title raises ValueError."""
         with pytest.raises(ValueError, match="Task title is required"):
             parse_task_args("--project sandbox")
+
+
+class TestParseSkipArgs:
+    """Test /skip command argument parsing."""
+
+    def test_no_args_skips_current(self) -> None:
+        """No args means skip current phase only."""
+        result = parse_skip_args("")
+        assert result is None  # None means "skip current"
+
+    def test_target_phase(self) -> None:
+        """Specific phase target."""
+        result = parse_skip_args("implement")
+        assert result == "implement"
+
+    def test_invalid_phase_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown phase"):
+            parse_skip_args("nonexistent")

@@ -15,6 +15,7 @@ from telegram.ext import ContextTypes
 from cortexbot.claude.cli import build_invocation, run_claude
 from cortexbot.claude.stream_parser import parse_stream_line
 from cortexbot.orchestrator.session_manager import SessionManager
+from cortexbot.orchestrator.task_manager import PHASES
 from cortexbot.bot.media import chunk_message
 
 logger = logging.getLogger(__name__)
@@ -157,13 +158,127 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         session_mgr.release()
 
 
+def parse_skip_args(text: str) -> str | None:
+    """Parse /skip arguments.
+
+    Args:
+        text: Raw argument text after /skip
+
+    Returns:
+        Target phase name, or None to skip just the current phase
+
+    Raises:
+        ValueError: If specified phase doesn't exist
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    if stripped not in PHASES:
+        raise ValueError(f"Unknown phase: '{stripped}'. Valid phases: {', '.join(PHASES)}")
+
+    return stripped
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /status — show current task state."""
+    store = context.bot_data.get("store")
+    if not store or not update.effective_message:
+        return
+
+    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
+    task = store.load_task(thread_id)
+
+    if not task:
+        await update.effective_message.reply_text("No task in this thread.")
+        return
+
+    lines = [
+        f"**Task:** {task.title}",
+        f"**Project:** {task.project}",
+        f"**Branch:** `{task.branch}`",
+        f"**Phase:** {task.current_phase} ({task.current_phase_status})",
+        f"**Autonomy:** {task.autonomy}",
+        f"**Budget:** ${task.budget_usd:.2f} remaining",
+        f"**Retries:** {task.retry_count}",
+    ]
+    if task.artifacts:
+        lines.append("**Artifacts:**")
+        for a in task.artifacts:
+            lines.append(f"  - [{a.artifact_type}] {a.path}")
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /continue — approve phase result and advance."""
+    # Full implementation wired in orchestration integration
+    await update.effective_message.reply_text("Continue acknowledged. (Orchestration pending)")
+
+
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /skip [phase] — skip current phase."""
+    if not update.effective_message or not update.effective_message.text:
+        return
+
+    raw_text = update.effective_message.text
+    arg_text = raw_text.split(maxsplit=1)[1] if " " in raw_text else ""
+
+    try:
+        target = parse_skip_args(arg_text)
+    except ValueError as e:
+        await update.effective_message.reply_text(str(e))
+        return
+
+    if target:
+        await update.effective_message.reply_text(f"Skipping to phase: {target}")
+    else:
+        await update.effective_message.reply_text("Skipping current phase.")
+
+
+async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /retry — re-run current phase."""
+    await update.effective_message.reply_text("Retry acknowledged. (Orchestration pending)")
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /cancel — kill running subprocess."""
-    session_mgr: SessionManager = context.bot_data.get("session_manager")
-    if not session_mgr:
-        return
-    if session_mgr.is_busy:
-        session_mgr.request_cancel()
-        await update.effective_message.reply_text("Cancellation requested...")
+    session_mgr = context.bot_data.get("session_manager")
+    if session_mgr:
+        killed = session_mgr.kill_subprocess()
+        if killed:
+            await update.effective_message.reply_text(
+                "Cancelled. Reply /retry to re-run this phase or /skip to move on."
+            )
+        else:
+            await update.effective_message.reply_text("No phase currently running.")
     else:
-        await update.effective_message.reply_text("No task currently running.")
+        await update.effective_message.reply_text("Session manager not initialized.")
+
+
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /tasks — list all active tasks."""
+    store = context.bot_data.get("store")
+    if not store:
+        await update.effective_message.reply_text("Store not initialized.")
+        return
+
+    all_tasks = store.list_tasks()
+    active = [t for t in all_tasks if t.current_phase_status != "done"]
+
+    if not active:
+        await update.effective_message.reply_text("No active tasks.")
+        return
+
+    lines = ["**Active Tasks:**"]
+    for t in sorted(active, key=lambda x: x.updated_at, reverse=True):
+        lines.append(
+            f"- [{t.title}] {t.project} — {t.current_phase} ({t.current_phase_status})"
+        )
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /budget [amount] — show or add budget."""
+    await update.effective_message.reply_text("Budget command. (Full implementation in M4)")
