@@ -145,7 +145,6 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 collected_text += event.text
 
         await process.wait()
-        session_mgr.current_pid = None
 
         # Send collected output to Telegram
         if collected_text:

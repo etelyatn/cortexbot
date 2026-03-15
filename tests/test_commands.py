@@ -36,10 +36,10 @@ class TestParseTaskArgs:
 
     def test_empty_title_raises(self) -> None:
         """Empty title raises ValueError."""
-        with pytest.raises(ValueError, match="title"):
+        with pytest.raises(ValueError, match="Task title is required"):
             parse_task_args("")
 
     def test_only_flags_raises(self) -> None:
         """Only flags and no title raises ValueError."""
-        with pytest.raises(ValueError, match="title"):
+        with pytest.raises(ValueError, match="Task title is required"):
             parse_task_args("--project sandbox")
