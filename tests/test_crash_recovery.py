@@ -1,7 +1,6 @@
 """Tests for crash recovery on startup."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
