@@ -91,7 +91,7 @@ def load_config(path: Path) -> BotConfig:
 
     Raises:
         FileNotFoundError: If config file doesn't exist
-        ValueError: If env vars are unset or required fields missing
+        ValueError: If env vars are unset
     """
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
