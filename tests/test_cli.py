@@ -23,6 +23,7 @@ class TestBuildInvocation:
         assert args[idx + 1] == "stream-json"
         assert "--dangerously-skip-permissions" in args
         assert "Do something" in args
+        assert args[-1] == "Do something"
 
     def test_session_id(self) -> None:
         """Session ID flag included when provided."""
@@ -94,6 +95,8 @@ class TestBuildInvocation:
             mcp_config=".mcp.json",
         )
         assert "--mcp-config" in inv.args
+        idx = inv.args.index("--mcp-config")
+        assert inv.args[idx + 1] == ".mcp.json"
 
     def test_cwd_set(self) -> None:
         """Working directory set to project path."""
