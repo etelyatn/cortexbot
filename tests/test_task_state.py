@@ -93,12 +93,16 @@ class TestTaskState:
         )
         task.current_phase_status = "completed"
         task.retry_count = 2
+        task.session_id = "some-session-id"
+        task.session_event_count = 5
 
         task.advance_phase(summary="Design done", artifacts=["/docs/design.md"])
 
         assert task.current_phase == "plan"
         assert task.current_phase_status == "pending"
         assert task.retry_count == 0
+        assert task.session_id is None
+        assert task.session_event_count == 0
         assert len(task.phase_history) == 1
         assert task.phase_history[0].phase == "design"
         assert task.phase_history[0].summary == "Design done"
