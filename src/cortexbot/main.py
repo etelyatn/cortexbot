@@ -5,15 +5,58 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+import psutil
 
 from cortexbot.config import load_config
 from cortexbot.events.bus import EventBus
 from cortexbot.bot.telegram import create_application
+from cortexbot.memory.store import TaskStore
+from cortexbot.orchestrator.task_manager import TaskState
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".cortexbot" / "config.yaml"
+
+
+async def recover_interrupted_tasks(store: TaskStore) -> list[TaskState]:
+    """Detect and mark interrupted tasks from a previous crash.
+
+    Scans all tasks for in_progress status with dead subprocess PIDs.
+
+    Returns:
+        List of tasks that were interrupted
+    """
+    interrupted = []
+
+    for task in store.list_tasks():
+        if task.current_phase_status != "in_progress":
+            continue
+
+        pid_alive = False
+        if task.subprocess_pid is not None:
+            try:
+                proc = psutil.Process(task.subprocess_pid)
+                pid_alive = proc.is_running()
+            except psutil.NoSuchProcess:
+                pid_alive = False
+
+        if not pid_alive:
+            task.current_phase_status = "interrupted"
+            task.subprocess_pid = None
+            task.updated_at = datetime.now(timezone.utc).isoformat()
+            store.save_task(task)
+            interrupted.append(task)
+            logger.warning(
+                "Task %d (%s) was interrupted — phase '%s' marked interrupted",
+                task.thread_id,
+                task.title,
+                task.current_phase,
+            )
+
+    return interrupted
 
 
 async def run(config_path: Path | None = None) -> None:
