@@ -9,6 +9,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from cortexbot.config import BotConfig
 from cortexbot.events.bus import EventBus
+from cortexbot.bot.commands import task_command, cancel_command
+from cortexbot.orchestrator.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,12 @@ def create_application(config: BotConfig, event_bus: EventBus) -> Application:
     # Store shared state in bot_data
     app.bot_data["config"] = config
     app.bot_data["event_bus"] = event_bus
+    app.bot_data["session_manager"] = SessionManager()
 
     # Register commands
     app.add_handler(CommandHandler("ping", _ping))
+    app.add_handler(CommandHandler("task", task_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
     logger.info("Telegram application created for group %s", config.telegram.group_id)
     return app
