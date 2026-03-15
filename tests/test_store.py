@@ -77,3 +77,18 @@ class TestTaskStore:
         tasks_dir = store._tasks_dir
         tmp_files = list(tasks_dir.glob("*.tmp"))
         assert tmp_files == []
+
+    def test_load_falls_back_to_tmp(self, store: TaskStore, sample_task: TaskState) -> None:
+        """Load falls back to .tmp if .json is corrupt."""
+        store.save_task(sample_task)
+        # Corrupt the main file
+        target = store._tasks_dir / "12345.json"
+        target.write_text("not valid json", encoding="utf-8")
+        # Should fall back to .tmp — but .tmp was removed by os.replace
+        # So manually create a valid .tmp to test the fallback
+        tmp = store._tasks_dir / "12345.json.tmp"
+        import json
+        tmp.write_text(json.dumps(sample_task.to_dict()), encoding="utf-8")
+        loaded = store.load_task(12345)
+        assert loaded is not None
+        assert loaded.thread_id == 12345

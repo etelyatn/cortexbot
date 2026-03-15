@@ -49,7 +49,7 @@ class TaskStore:
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
                     return TaskState.from_dict(data)
-                except (json.JSONDecodeError, KeyError) as e:
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
                     logger.warning("Corrupt task file %s: %s", path, e)
                     continue
 
@@ -65,7 +65,7 @@ class TaskStore:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 tasks.append(TaskState.from_dict(data))
-            except (json.JSONDecodeError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
                 logger.warning("Skipping corrupt task file %s: %s", path, e)
         return tasks
 
