@@ -129,3 +129,44 @@ class TestTaskState:
         assert len(task.artifacts) == 1
         assert task.artifacts[0].artifact_type == "design_doc"
         assert task.artifacts[0].path == "/docs/design.md"
+
+
+class TestBudget:
+    """Test budget tracking."""
+
+    def test_deduct_cost(self) -> None:
+        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=10.0)
+        task.deduct_cost(3.5)
+        assert task.budget_usd == 6.5
+
+    def test_deduct_does_not_go_negative(self) -> None:
+        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=2.0)
+        task.deduct_cost(5.0)
+        assert task.budget_usd == 0.0
+
+    def test_add_budget(self) -> None:
+        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=5.0)
+        task.add_budget(3.0)
+        assert task.budget_usd == 8.0
+
+    def test_phase_budget_design_with_10(self) -> None:
+        """Design phase with $10: 50% of remaining ($10) = $5, capped for this phase."""
+        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=10.0)
+        # design = index 0, 5 remaining phases
+        # Formula: (remaining * 0.5) / remaining_phases, min $1
+        # = ($10 * 0.5) / 5 phases = $1.00
+        budget = task.calculate_phase_budget()
+        assert budget == 1.0
+
+    def test_phase_budget_last_phase(self) -> None:
+        """Merge (last phase) gets all remaining budget."""
+        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=3.0)
+        task.current_phase = "merge"
+        budget = task.calculate_phase_budget()
+        assert budget == 3.0
+
+    def test_phase_budget_minimum_is_one(self) -> None:
+        """Phase budget never goes below $1."""
+        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=0.50)
+        budget = task.calculate_phase_budget()
+        assert budget == 1.0

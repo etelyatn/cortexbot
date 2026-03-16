@@ -169,6 +169,29 @@ class TaskState:
         self.artifacts.append(Artifact(artifact_type=artifact_type, path=path, phase=phase))
         self.updated_at = datetime.now(timezone.utc).isoformat()
 
+    def deduct_cost(self, cost_usd: float) -> None:
+        """Deduct cost from remaining budget."""
+        self.budget_usd = max(0.0, self.budget_usd - cost_usd)
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def add_budget(self, amount_usd: float) -> None:
+        """Add budget to remaining balance."""
+        self.budget_usd += amount_usd
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+
+    def calculate_phase_budget(self) -> float:
+        """Calculate budget for the next phase.
+
+        Formula per spec: 50% of remaining divided across remaining phase count.
+        Last phase gets all remaining budget.
+        """
+        remaining_phases = len(PHASES) - PHASES.index(self.current_phase)
+        if remaining_phases <= 1:
+            return max(1.0, self.budget_usd)
+
+        phase_budget = (self.budget_usd * 0.5) / remaining_phases
+        return max(1.0, round(phase_budget, 2))
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict."""
         return {
