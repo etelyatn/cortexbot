@@ -32,3 +32,24 @@ class TestExtractArtifacts:
     def test_empty_list(self) -> None:
         result = extract_artifacts_from_status([], phase="design")
         assert result == []
+
+    def test_extracts_impl_guide(self) -> None:
+        """Recognize impl guides."""
+        paths = ["docs/plans/2026-03-15-impl-guide.md"]
+        result = extract_artifacts_from_status(paths, phase="plan")
+        assert len(result) == 1
+        assert result[0]["type"] == "impl_guide"
+
+    def test_extracts_screenshot(self) -> None:
+        """Recognize screenshot images."""
+        paths = ["screenshots/test_result.png"]
+        result = extract_artifacts_from_status(paths, phase="test")
+        assert len(result) == 1
+        assert result[0]["type"] == "screenshot"
+
+    def test_extracts_diff(self) -> None:
+        """Recognize diff/patch files."""
+        paths = ["changes.diff"]
+        result = extract_artifacts_from_status(paths, phase="merge")
+        assert len(result) == 1
+        assert result[0]["type"] == "diff"
