@@ -24,7 +24,6 @@ from cortexbot.events.bus import EventBus
 from cortexbot.health.preflight import check_editor_alive, check_git_branch
 from cortexbot.log import InvocationLogger
 from cortexbot.memory.artifacts import extract_artifacts_from_status
-from cortexbot.memory.session_rotation import should_rotate
 from cortexbot.memory.store import TaskStore
 from cortexbot.orchestrator.autonomy import (
     AutonomyDecision,
