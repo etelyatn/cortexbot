@@ -13,6 +13,7 @@ import psutil
 from cortexbot.config import load_config
 from cortexbot.events.bus import EventBus
 from cortexbot.bot.telegram import create_application
+from cortexbot.events.telegram_handler import TelegramEventHandler
 from cortexbot.memory.store import TaskStore
 from cortexbot.orchestrator.task_manager import TaskState
 from cortexbot.orchestrator.session_manager import SessionManager
@@ -88,6 +89,9 @@ async def run(config_path: Path | None = None) -> None:
     app = create_application(config, event_bus)
     app.bot_data["store"] = store
     app.bot_data["session_manager"] = session_mgr
+
+    # Wire event handler so phase/task events are posted to Telegram
+    telegram_handler = TelegramEventHandler(app.bot, event_bus)
 
     # Shutdown event
     shutdown_event = asyncio.Event()

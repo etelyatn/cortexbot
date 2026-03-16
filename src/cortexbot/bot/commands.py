@@ -673,6 +673,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Handle /cancel — kill running subprocess."""
     session_mgr = context.bot_data.get("session_manager")
     if session_mgr:
+        session_mgr.request_cancel()
         killed = session_mgr.kill_subprocess()
         if killed:
             await update.effective_message.reply_text(
