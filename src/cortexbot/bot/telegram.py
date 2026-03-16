@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from cortexbot.config import BotConfig
 from cortexbot.events.bus import EventBus
-from cortexbot.memory.store import TaskStore
 from cortexbot.bot.commands import (
     task_command,
     status_command,
@@ -21,8 +18,6 @@ from cortexbot.bot.commands import (
     tasks_command,
     budget_command,
 )
-from cortexbot.orchestrator.session_manager import SessionManager
-
 logger = logging.getLogger(__name__)
 
 
@@ -43,11 +38,9 @@ def create_application(config: BotConfig, event_bus: EventBus) -> Application:
     """
     app = Application.builder().token(config.telegram.bot_token).build()
 
-    # Store shared state in bot_data
+    # Store shared state in bot_data (SessionManager + TaskStore added by main.py)
     app.bot_data["config"] = config
     app.bot_data["event_bus"] = event_bus
-    app.bot_data["session_manager"] = SessionManager()
-    app.bot_data["store"] = TaskStore(base_dir=Path.home() / ".cortexbot")
 
     # Register commands
     app.add_handler(CommandHandler("ping", _ping))

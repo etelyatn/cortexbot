@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess as sp
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Coroutine
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -90,28 +90,48 @@ def parse_task_args(text: str) -> TaskArgs:
     return TaskArgs(title=title, project=project, autonomy=autonomy)
 
 
+async def _safe_run_task(
+    coro: Coroutine[Any, Any, None],
+    event_bus: EventBus,
+    thread_id: int,
+) -> None:
+    """Wrapper for fire-and-forget tasks — catches and reports exceptions."""
+    try:
+        await coro
+    except Exception:
+        logger.exception("Task loop crashed for thread %d", thread_id)
+        await event_bus.emit("escalation.needed", {
+            "event_type": "escalation.needed",
+            "thread_id": thread_id,
+            "phase": "unknown",
+            "reason": "Internal error — task loop crashed. Check bot logs.",
+        })
+
+
 async def _create_task_branch(project_path: str, branch: str, default_branch: str) -> bool:
     """Create and checkout a new task branch.
 
+    Uses asyncio subprocess to avoid blocking the event loop.
     Returns True on success, False on failure.
     """
     try:
-        sp.run(
-            ["git", "checkout", default_branch],
-            capture_output=True,
-            text=True,
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", default_branch,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             cwd=project_path,
-            timeout=10,
         )
-        result = sp.run(
-            ["git", "checkout", "-b", branch],
-            capture_output=True,
-            text=True,
+        await asyncio.wait_for(proc.wait(), timeout=10)
+
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "-b", branch,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             cwd=project_path,
-            timeout=10,
         )
-        return result.returncode == 0
-    except (sp.SubprocessError, OSError) as e:
+        await asyncio.wait_for(proc.wait(), timeout=10)
+        return proc.returncode == 0
+    except (OSError, asyncio.TimeoutError) as e:
         logger.error("Failed to create branch %s: %s", branch, e)
         return False
 
@@ -199,6 +219,9 @@ async def _run_phase_once(
     timeout_secs = config.defaults.timeouts.get(
         task.current_phase, config.defaults.timeouts.get("default", 900)
     )
+
+    # Clear any stale cancel flag from a previous cancellation
+    session_mgr.clear_cancel()
 
     await session_mgr.acquire()
     try:
@@ -527,7 +550,10 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Start first phase (fire-and-forget so Telegram handler stays responsive)
     prompts_dir = Path(__file__).parent.parent.parent.parent / "prompts"
-    asyncio.create_task(_run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir))
+    asyncio.create_task(_safe_run_task(
+        _run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir),
+        event_bus, thread_id,
+    ))
 
 
 def parse_skip_args(text: str) -> str | None:
@@ -610,7 +636,10 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if task.current_phase_status in ("completed", "pending"):
         await update.effective_message.reply_text(f"Starting {task.current_phase} phase...")
         prompts_dir = Path(__file__).parent.parent.parent.parent / "prompts"
-        asyncio.create_task(_run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir))
+        asyncio.create_task(_safe_run_task(
+            _run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir),
+            event_bus, task.thread_id,
+        ))
     elif task.current_phase_status == "interrupted":
         await update.effective_message.reply_text(
             f"Phase {task.current_phase} was interrupted. Use /retry to re-run or /skip to move on."
@@ -618,8 +647,24 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /skip [phase] — skip current phase."""
+    """Handle /skip [phase] — skip current or advance to target phase."""
     if not update.effective_message or not update.effective_message.text:
+        return
+
+    store: TaskStore = context.bot_data["store"]
+    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
+    task = store.load_task(thread_id)
+
+    if not task:
+        await update.effective_message.reply_text("No task in this thread.")
+        return
+
+    if task.current_phase_status == "in_progress":
+        await update.effective_message.reply_text("Phase in progress. Use /cancel first.")
+        return
+
+    if task.current_phase_status == "done":
+        await update.effective_message.reply_text("Task already completed.")
         return
 
     raw_text = update.effective_message.text
@@ -631,10 +676,38 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text(str(e))
         return
 
+    # Skip current phase (or multiple phases to reach target)
+    skipped_phases = []
     if target:
-        await update.effective_message.reply_text(f"Skipping to phase: {target}")
+        while task.current_phase != target and task.current_phase_status != "done":
+            skipped_phases.append(task.current_phase)
+            task.phase_history.append(PhaseRecord(
+                phase=task.current_phase, status="skipped",
+            ))
+            nxt = next_phase(task.current_phase)
+            if nxt is None:
+                break
+            task.current_phase = nxt
+            task.current_phase_status = "pending"
+            task.retry_count = 0
     else:
-        await update.effective_message.reply_text("Skipping current phase.")
+        skipped_phases.append(task.current_phase)
+        task.phase_history.append(PhaseRecord(
+            phase=task.current_phase, status="skipped",
+        ))
+        nxt = next_phase(task.current_phase)
+        if nxt is None:
+            task.current_phase_status = "done"
+        else:
+            task.current_phase = nxt
+            task.current_phase_status = "pending"
+            task.retry_count = 0
+
+    store.save_task(task)
+    skipped_str = ", ".join(skipped_phases)
+    await update.effective_message.reply_text(
+        f"Skipped: {skipped_str}. Now at: {task.current_phase} ({task.current_phase_status})"
+    )
 
 
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -666,7 +739,10 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Retrying {task.current_phase} phase (attempt {task.retry_count + 1})..."
     )
     prompts_dir = Path(__file__).parent.parent.parent.parent / "prompts"
-    asyncio.create_task(_run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir))
+    asyncio.create_task(_safe_run_task(
+        _run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir),
+        event_bus, task.thread_id,
+    ))
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -710,4 +786,35 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /budget [amount] — show or add budget."""
-    await update.effective_message.reply_text("Budget command. (Full implementation in M4)")
+    if not update.effective_message:
+        return
+
+    store: TaskStore = context.bot_data["store"]
+    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
+    task = store.load_task(thread_id)
+
+    if not task:
+        await update.effective_message.reply_text("No task in this thread.")
+        return
+
+    raw_text = update.effective_message.text or ""
+    arg_text = raw_text.split(maxsplit=1)[1].strip() if " " in raw_text else ""
+
+    if not arg_text:
+        await update.effective_message.reply_text(
+            f"Budget: ${task.budget_usd:.2f} remaining\n"
+            f"Phase: {task.current_phase} (budget cap: ${task.calculate_phase_budget():.2f})"
+        )
+        return
+
+    try:
+        amount = float(arg_text)
+    except ValueError:
+        await update.effective_message.reply_text("Usage: /budget [amount]")
+        return
+
+    task.add_budget(amount)
+    store.save_task(task)
+    await update.effective_message.reply_text(
+        f"Added ${amount:.2f}. New balance: ${task.budget_usd:.2f}"
+    )

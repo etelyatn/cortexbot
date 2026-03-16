@@ -69,32 +69,34 @@ class StatusBlock:
         """Extract status block from assistant message text.
 
         Scans for JSON matching {"status": "complete|escalate|blocked"}.
+        Takes the LAST match (Claude often references the format before
+        producing the actual status at the end).
         Returns None if not found.
         """
-        match = _STATUS_PATTERN.search(text)
-        if not match:
+        matches = list(_STATUS_PATTERN.finditer(text))
+        if not matches:
             return None
 
-        # Find the full JSON object starting at match position
-        start = match.start()
-        try:
-            # Find matching closing brace
-            depth = 0
-            for i, ch in enumerate(text[start:], start=start):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        obj = json.loads(text[start : i + 1])
-                        return cls(
-                            status=obj["status"],
-                            summary=obj.get("summary"),
-                            reason=obj.get("reason"),
-                            artifacts=obj.get("artifacts", []),
-                        )
-        except (json.JSONDecodeError, KeyError):
-            return None
+        # Try matches in reverse — last match is most likely the actual status
+        for match in reversed(matches):
+            start = match.start()
+            try:
+                depth = 0
+                for i, ch in enumerate(text[start:], start=start):
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            obj = json.loads(text[start : i + 1])
+                            return cls(
+                                status=obj["status"],
+                                summary=obj.get("summary"),
+                                reason=obj.get("reason"),
+                                artifacts=obj.get("artifacts", []),
+                            )
+            except (json.JSONDecodeError, KeyError):
+                continue
 
         return None
 
@@ -136,7 +138,13 @@ def parse_stream_line(line: str) -> StreamEvent | None:
         event.tool_input = data.get("tool_input")
 
     elif event_type == "tool_result":
-        event.content = data.get("content")
+        raw_content = data.get("content")
+        if isinstance(raw_content, list):
+            event.content = "".join(
+                p.get("text", "") for p in raw_content if isinstance(p, dict)
+            )
+        else:
+            event.content = raw_content
         event.is_error = data.get("is_error", False)
 
     elif event_type == "result":

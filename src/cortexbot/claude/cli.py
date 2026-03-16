@@ -45,12 +45,16 @@ def build_invocation(
     Returns:
         ClaudeInvocation with args list and cwd
     """
-    args = [binary, "-p", "--output-format", "stream-json"]
+    args = [binary, "--output-format", "stream-json"]
 
     if resume_session_id:
+        # Resume mode: prompt is sent as a continuation message, not -p
         args.extend(["--resume", resume_session_id])
-    elif session_id:
-        args.extend(["--session-id", session_id])
+    else:
+        # Print mode: single prompt invocation
+        args.append("-p")
+        if session_id:
+            args.extend(["--session-id", session_id])
 
     if system_prompt:
         args.extend(["--append-system-prompt", system_prompt])

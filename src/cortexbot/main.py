@@ -91,7 +91,9 @@ async def run(config_path: Path | None = None) -> None:
     app.bot_data["session_manager"] = session_mgr
 
     # Wire event handler so phase/task events are posted to Telegram
-    telegram_handler = TelegramEventHandler(app.bot, event_bus)
+    telegram_handler = TelegramEventHandler(
+        app.bot, event_bus, group_chat_id=config.telegram.group_id,
+    )
 
     # Shutdown event
     shutdown_event = asyncio.Event()

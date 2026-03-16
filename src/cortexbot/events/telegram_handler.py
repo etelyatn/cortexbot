@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 class TelegramEventHandler:
     """Subscribes to event bus and posts notifications to Telegram threads."""
 
-    def __init__(self, bot: Bot, event_bus: EventBus) -> None:
+    def __init__(self, bot: Bot, event_bus: EventBus, group_chat_id: int | None = None) -> None:
         self._bot = bot
         self._bus = event_bus
+        self._group_chat_id = group_chat_id
         self._register()
 
     def _register(self) -> None:
@@ -48,11 +49,16 @@ class TelegramEventHandler:
         message = self._format_event(payload)
         if message:
             try:
-                await self._bot.send_message(
-                    chat_id=thread_id,
-                    text=message,
-                    parse_mode="Markdown",
-                )
+                # Use group_chat_id if available, thread_id as message_thread_id
+                chat_id = self._group_chat_id or thread_id
+                kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "Markdown",
+                }
+                if self._group_chat_id and thread_id != chat_id:
+                    kwargs["message_thread_id"] = thread_id
+                await self._bot.send_message(**kwargs)
             except Exception as e:
                 logger.error("Failed to send Telegram notification: %s", e)
 
