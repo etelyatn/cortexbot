@@ -37,6 +37,42 @@ uv sync --all-extras
 uv run cortexbot --help
 ```
 
+## Telegram Setup
+
+<details>
+<summary>Create a bot and configure your Telegram group (click to expand)</summary>
+
+### 1. Create a bot with BotFather
+
+1. Open [@BotFather](https://t.me/BotFather) in Telegram
+2. Send `/newbot` and follow the prompts to choose a name and username
+3. Copy the **bot token** (looks like `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
+
+### 2. Create a Telegram group
+
+1. Create a new group in Telegram (or use an existing one)
+2. **Enable Topics** (optional but recommended): Group Settings → Topics → toggle on. This gives each task its own thread.
+3. Add your bot to the group
+
+### 3. Get the group ID
+
+The easiest way to find your group chat ID:
+
+1. Add [@RawDataBot](https://t.me/RawDataBot) to your group temporarily
+2. It will reply with a JSON message — look for `"chat": {"id": -100...}`
+3. Copy that number (including the `-100` prefix)
+4. Remove RawDataBot from the group
+
+### 4. Set bot permissions
+
+In BotFather, send `/mybots` → select your bot → **Bot Settings**:
+- **Group Privacy** → Turn **OFF** (so the bot can read commands in groups)
+- **Allow Groups** → Turn **ON**
+
+If using Topics, also grant the bot **admin rights** in the group so it can post to any topic.
+
+</details>
+
 ## Configuration
 
 ```bash
@@ -50,7 +86,7 @@ Edit `~/.cortexbot/config.yaml`:
 ```yaml
 telegram:
   bot_token: "${CORTEXBOT_TELEGRAM_TOKEN}"  # set this env var
-  group_id: -100...                          # your Telegram group ID
+  group_id: -1001234567890                   # your group ID from step 3 above
 
 projects:
   sandbox:
