@@ -15,6 +15,7 @@ from cortexbot.events.bus import EventBus
 from cortexbot.bot.telegram import create_application
 from cortexbot.memory.store import TaskStore
 from cortexbot.orchestrator.task_manager import TaskState
+from cortexbot.orchestrator.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +61,46 @@ async def recover_interrupted_tasks(store: TaskStore) -> list[TaskState]:
 
 
 async def run(config_path: Path | None = None) -> None:
-    """Start CortexBot.
+    """Start CortexBot."""
+    import signal
 
-    Args:
-        config_path: Override path to config.yaml. Defaults to ~/.cortexbot/config.yaml
-    """
     path = config_path or DEFAULT_CONFIG_PATH
     logger.info("Loading config from %s", path)
     config = load_config(path)
 
+    # Initialize components
+    base_dir = Path.home() / ".cortexbot"
+    store = TaskStore(base_dir=base_dir)
     event_bus = EventBus()
+    session_mgr = SessionManager()
+
+    # Crash recovery
+    interrupted = await recover_interrupted_tasks(store)
+    for task in interrupted:
+        logger.warning(
+            "Task %d (%s) was interrupted in phase '%s'",
+            task.thread_id,
+            task.title,
+            task.current_phase,
+        )
+
+    # Build Telegram app
     app = create_application(config, event_bus)
+    app.bot_data["store"] = store
+    app.bot_data["session_manager"] = session_mgr
+
+    # Shutdown event
+    shutdown_event = asyncio.Event()
+
+    def request_shutdown() -> None:
+        logger.info("Shutdown requested")
+        shutdown_event.set()
+
+    # Register signal handlers
+    loop = asyncio.get_running_loop()
+    if sys.platform != "win32":
+        loop.add_signal_handler(signal.SIGINT, request_shutdown)
+        loop.add_signal_handler(signal.SIGTERM, request_shutdown)
 
     logger.info("CortexBot starting polling...")
     await app.initialize()
@@ -80,16 +110,28 @@ async def run(config_path: Path | None = None) -> None:
         drop_pending_updates=True,
     )
 
-    # Run until stopped
+    # Wait for shutdown signal
     try:
-        await asyncio.Event().wait()
-    except asyncio.CancelledError:
+        await shutdown_event.wait()
+    except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
         logger.info("CortexBot shutting down...")
+
+        # Kill any running subprocess
+        if session_mgr.current_pid:
+            session_mgr.kill_subprocess()
+
+        # Save all task states
+        for task in store.list_tasks():
+            if task.current_phase_status == "in_progress":
+                task.current_phase_status = "interrupted"
+                store.save_task(task)
+
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        logger.info("CortexBot stopped.")
 
 
 def main() -> None:
