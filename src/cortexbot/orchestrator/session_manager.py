@@ -1,7 +1,6 @@
 """Claude Code subprocess lifecycle and global mutex.
 
-One task runs at a time globally (V1). The mutex prevents concurrent
-Claude Code invocations.
+One subprocess at a time. Tasks and chats are mutually exclusive.
 """
 
 from __future__ import annotations
@@ -21,11 +20,12 @@ class SessionManager:
         self._lock = asyncio.Lock()
         self._current_pid: int | None = None
         self._cancel_requested = False
+        self.active_type: str | None = None  # "task" | "chat"
 
     @property
     def is_busy(self) -> bool:
-        """Whether the mutex is currently held."""
-        return self._lock.locked()
+        """Whether a subprocess is active."""
+        return self.active_type is not None
 
     @property
     def current_pid(self) -> int | None:
@@ -48,12 +48,26 @@ class SessionManager:
         """Clear cancellation flag."""
         self._cancel_requested = False
 
-    async def acquire(self) -> None:
+    async def acquire(self, subprocess_type: str = "task") -> None:
         """Acquire the global mutex. Blocks until available."""
         await self._lock.acquire()
+        self.active_type = subprocess_type
+        self._cancel_requested = False
+
+    async def try_acquire(self, subprocess_type: str = "task") -> None:
+        """Try to acquire — raises RuntimeError if busy."""
+        if self.is_busy:
+            raise RuntimeError(
+                f"A {self.active_type} is running. "
+                f"{'Use /cancel or wait.' if self.active_type == 'task' else 'Wait for response.'}"
+            )
+        await self.acquire(subprocess_type)
 
     def release(self) -> None:
-        """Release the global mutex."""
+        """Release the global mutex and clear state."""
+        self.active_type = None
+        self._current_pid = None
+        self._cancel_requested = False
         try:
             self._lock.release()
         except RuntimeError:

@@ -73,3 +73,36 @@ class TestSessionManager:
         result = mgr.kill_subprocess()
         assert result is False
         assert mgr.current_pid is None
+
+    async def test_active_type_tracking(self) -> None:
+        """Session manager tracks whether active subprocess is task or chat."""
+        sm = SessionManager()
+        assert sm.active_type is None
+
+        await sm.acquire(subprocess_type="task")
+        assert sm.active_type == "task"
+        assert sm.is_busy
+
+        sm.release()
+        assert sm.active_type is None
+        assert not sm.is_busy
+
+    async def test_chat_blocked_by_task(self) -> None:
+        """Cannot start chat while task subprocess is running."""
+        sm = SessionManager()
+        await sm.acquire(subprocess_type="task")
+
+        with pytest.raises(RuntimeError, match="task"):
+            await sm.try_acquire(subprocess_type="chat")
+
+        sm.release()
+
+    async def test_task_blocked_by_chat(self) -> None:
+        """Cannot start task while chat subprocess is running."""
+        sm = SessionManager()
+        await sm.acquire(subprocess_type="chat")
+
+        with pytest.raises(RuntimeError, match="chat"):
+            await sm.try_acquire(subprocess_type="task")
+
+        sm.release()
