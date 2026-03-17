@@ -9,11 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
+from dotenv import load_dotenv
 
 from cortexbot.config import load_config
 from cortexbot.events.bus import EventBus
 from cortexbot.bot.telegram import create_application
-from cortexbot.events.telegram_handler import TelegramEventHandler
 from cortexbot.memory.store import TaskStore
 from cortexbot.orchestrator.task_manager import TaskState
 from cortexbot.orchestrator.session_manager import SessionManager
@@ -24,38 +24,39 @@ DEFAULT_CONFIG_PATH = Path.home() / ".cortexbot" / "config.yaml"
 
 
 async def recover_interrupted_tasks(store: TaskStore) -> list[TaskState]:
-    """Detect and mark interrupted tasks from a previous crash.
+    """Detect and clean up tasks with dead subprocess PIDs.
 
-    Scans all tasks for in_progress status with dead subprocess PIDs.
+    Scans all active tasks for dead subprocess PIDs. Clears PID and session
+    so the task can be resumed from its last artifact.
 
     Returns:
-        List of tasks that were interrupted
+        List of tasks that had dead PIDs cleared
     """
     interrupted = []
 
     for task in store.list_tasks():
-        if task.current_phase_status != "in_progress":
+        if task.status != "active" or task.subprocess_pid is None:
             continue
 
         pid_alive = False
-        if task.subprocess_pid is not None:
-            try:
-                proc = psutil.Process(task.subprocess_pid)
-                pid_alive = proc.is_running()
-            except psutil.NoSuchProcess:
-                pid_alive = False
+        try:
+            proc = psutil.Process(task.subprocess_pid)
+            pid_alive = proc.is_running()
+        except psutil.NoSuchProcess:
+            pid_alive = False
 
         if not pid_alive:
-            task.current_phase_status = "interrupted"
             task.subprocess_pid = None
+            task.session_id = None
+            task.last_error = "Process died — will resume from last artifact"
             task.updated_at = datetime.now(timezone.utc).isoformat()
             store.save_task(task)
             interrupted.append(task)
             logger.warning(
-                "Task %d (%s) was interrupted — phase '%s' marked interrupted",
-                task.thread_id,
-                task.title,
-                task.current_phase,
+                "Task %s (%s) — dead PID cleared, will resume at '%s'",
+                task.task_id,
+                task.description[:50],
+                task.next_action,
             )
 
     return interrupted
@@ -65,13 +66,18 @@ async def run(config_path: Path | None = None) -> None:
     """Start CortexBot."""
     import signal
 
+    # Load .env from bot directory
+    bot_dir = Path.home() / ".cortexbot"
+    env_path = bot_dir / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+
     path = config_path or DEFAULT_CONFIG_PATH
     logger.info("Loading config from %s", path)
     config = load_config(path)
 
     # Initialize components
-    base_dir = Path.home() / ".cortexbot"
-    store = TaskStore(base_dir=base_dir)
+    store = TaskStore(base_dir=bot_dir)
     event_bus = EventBus()
     session_mgr = SessionManager()
 
@@ -79,10 +85,10 @@ async def run(config_path: Path | None = None) -> None:
     interrupted = await recover_interrupted_tasks(store)
     for task in interrupted:
         logger.warning(
-            "Task %d (%s) was interrupted in phase '%s'",
-            task.thread_id,
-            task.title,
-            task.current_phase,
+            "Task %s (%s) — will resume at '%s'",
+            task.task_id,
+            task.description[:50],
+            task.next_action,
         )
 
     # Build Telegram app
@@ -90,10 +96,10 @@ async def run(config_path: Path | None = None) -> None:
     app.bot_data["store"] = store
     app.bot_data["session_manager"] = session_mgr
 
-    # Wire event handler so phase/task events are posted to Telegram
-    telegram_handler = TelegramEventHandler(
-        app.bot, event_bus, group_chat_id=config.telegram.group_id,
-    )
+    # V2: TelegramEventHandler wiring deferred to Task 16
+    # telegram_handler = TelegramEventHandler(
+    #     app.bot, event_bus, group_chat_id=config.telegram.group_id,
+    # )
 
     # Shutdown event
     shutdown_event = asyncio.Event()
@@ -128,10 +134,12 @@ async def run(config_path: Path | None = None) -> None:
         if session_mgr.current_pid:
             session_mgr.kill_subprocess()
 
-        # Save all task states
+        # Save interrupted tasks on shutdown
         for task in store.list_tasks():
-            if task.current_phase_status == "in_progress":
-                task.current_phase_status = "interrupted"
+            if task.status == "active" and task.subprocess_pid is not None:
+                task.subprocess_pid = None
+                task.session_id = None
+                task.last_error = "Bot shutdown"
                 store.save_task(task)
 
         await app.updater.stop()
