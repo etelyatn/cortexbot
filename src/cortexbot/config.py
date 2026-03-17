@@ -122,5 +122,7 @@ def add_project(config_path: Path, name: str, path: str, group_id: int) -> None:
         "group_id": group_id,
     }
 
-    with open(config_path, "w") as f:
+    tmp = config_path.with_suffix(".yaml.tmp")
+    with open(tmp, "w") as f:
         yaml.dump(raw, f, default_flow_style=False)
+    os.replace(str(tmp), str(config_path))

@@ -83,7 +83,7 @@ async def run(config_path: Path | None = None) -> None:
     session_mgr = SessionManager()
 
     # Wire commands
-    init_commands(config, store, session_mgr, event_bus)
+    init_commands(config, store, session_mgr, event_bus, chat_store=chat_store)
 
     # Crash recovery
     interrupted = await recover_interrupted_tasks(store)

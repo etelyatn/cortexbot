@@ -13,37 +13,34 @@ def tmp_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def sample_config_yaml(tmp_dir: Path) -> Path:
-    """Write a minimal config.yaml and return its path."""
+    """Write a minimal V2 config.yaml and return its path."""
     config = tmp_dir / "config.yaml"
     config.write_text(
         """\
 telegram:
   bot_token: "${TEST_BOT_TOKEN}"
-  group_id: -1001234567890
 
 projects:
   sandbox:
     path: "D:/UnrealProjects/CortexSandbox"
     mcp_config: ".mcp.json"
     default_branch: "main"
+    group_id: -1001234567890
 
 defaults:
-  autonomy: "supervised"
-  budget_usd: 10.00
-  phase_budgets:
-    design: 3.00
-    plan: 2.00
-    implement: 5.00
-    test: 3.00
-    merge: 1.00
-  session_rotation:
-    design: 50
-    plan: 50
-    implement: 100
-    test: 40
+  token_budget: 500000
   timeouts:
-    implement: 1800
+    brainstorm: 900
+    plan: 900
+    execute: 1800
+    review: 900
+    chat: 600
     default: 900
+  session_rotation:
+    execute: 100
+  max_cycles: 3
+  chat:
+    inactivity_timeout: 7200
 
 logging:
   invocation_logs: true

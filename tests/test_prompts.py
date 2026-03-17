@@ -4,7 +4,10 @@ from cortexbot.orchestrator.task_manager import TaskState, ReviewResult, TestRes
 
 def test_build_prompt_brainstorm():
     task = TaskState(task_id="1", project="sandbox", description="Add inventory system")
-    assert build_prompt(task, "brainstorm") == "/brainstorming Add inventory system"
+    result = build_prompt(task, "brainstorm")
+    assert result.startswith("/brainstorming ")
+    assert "Add inventory system" in result
+    assert "USER MESSAGE" in result  # Fenced for prompt injection mitigation
 
 
 def test_build_prompt_plan():

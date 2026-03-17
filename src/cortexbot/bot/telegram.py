@@ -8,20 +8,19 @@ from telegram.ext import Application, CommandHandler
 from cortexbot.bot.commands import (
     cmd_ping, cmd_task, cmd_continue, cmd_cancel, cmd_status,
     cmd_budget, cmd_tasks, cmd_auto, cmd_project_add,
-    cmd_project_validate, cmd_answer, cmd_chat, cmd_chat_end,
-    cmd_chat_history, cmd_test, init_commands,
+    cmd_project_validate, cmd_editor, cmd_answer, cmd_chat,
+    cmd_chat_end, cmd_chat_history, cmd_test,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def create_application(config, event_bus, task_store=None, session_manager=None) -> Application:
-    """Build and configure the Telegram Application."""
-    app = Application.builder().token(config.telegram.bot_token).build()
+    """Build and configure the Telegram Application.
 
-    # Wire commands module
-    if task_store and session_manager:
-        init_commands(config, task_store, session_manager, event_bus)
+    Note: init_commands() must be called before this function to wire dependencies.
+    """
+    app = Application.builder().token(config.telegram.bot_token).build()
 
     # Register handlers
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -29,6 +28,7 @@ def create_application(config, event_bus, task_store=None, session_manager=None)
     # Project management
     app.add_handler(CommandHandler("project_add", cmd_project_add))
     app.add_handler(CommandHandler("project_validate", cmd_project_validate))
+    app.add_handler(CommandHandler("editor", cmd_editor))
 
     # Task lifecycle
     app.add_handler(CommandHandler("task", cmd_task))

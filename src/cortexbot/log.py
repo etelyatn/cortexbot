@@ -12,19 +12,19 @@ logger = logging.getLogger(__name__)
 class InvocationLogger:
     """Write stream-json lines to per-invocation log files.
 
-    Files stored at: {base_dir}/logs/invocations/{date}/{task_id}_{phase}_{timestamp}.jsonl
+    Files stored at: {base_dir}/logs/invocations/{date}/{task_id}_{action}_{timestamp}.jsonl
     """
 
     def __init__(self, base_dir: Path) -> None:
         self._base_dir = base_dir
 
-    def create_log(self, task_id: int, phase: str) -> Path:
+    def create_log(self, task_id: int, action: str) -> Path:
         """Create a new invocation log file and return its path."""
         now = datetime.now(timezone.utc)
         date_dir = self._base_dir / "logs" / "invocations" / now.strftime("%Y-%m-%d")
         date_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = f"{task_id}_{phase}_{now.strftime('%H%M%S')}.jsonl"
+        filename = f"{task_id}_{action}_{now.strftime('%H%M%S')}.jsonl"
         path = date_dir / filename
         path.touch()
 

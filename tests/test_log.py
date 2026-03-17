@@ -13,7 +13,7 @@ class TestInvocationLogger:
     def test_create_log_returns_path(self, tmp_dir: Path) -> None:
         """create_log returns a path and creates the file."""
         logger = InvocationLogger(tmp_dir)
-        path = logger.create_log(task_id=123, phase="design")
+        path = logger.create_log(task_id=123, action="design")
         assert path.exists()
         assert path.suffix == ".jsonl"
         assert "123" in path.name
@@ -22,7 +22,7 @@ class TestInvocationLogger:
     def test_append_line(self, tmp_dir: Path) -> None:
         """Lines are appended with newline."""
         logger = InvocationLogger(tmp_dir)
-        path = logger.create_log(task_id=1, phase="test")
+        path = logger.create_log(task_id=1, action="test")
         logger.append_line(path, '{"type":"assistant"}')
         logger.append_line(path, '{"type":"result"}')
         lines = path.read_text().strip().split("\n")
@@ -42,7 +42,7 @@ class TestInvocationLogger:
     def test_cleanup_preserves_recent(self, tmp_dir: Path) -> None:
         """Cleanup preserves recent log directories."""
         logger = InvocationLogger(tmp_dir)
-        path = logger.create_log(task_id=1, phase="design")
+        path = logger.create_log(task_id=1, action="design")
         deleted = logger.cleanup_old_logs(retention_days=30)
         assert deleted == 0
         assert path.exists()

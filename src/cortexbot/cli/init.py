@@ -22,10 +22,6 @@ def check_superpowers() -> bool:
     """Check if superpowers plugin is installed in Claude Code."""
     try:
         result = subprocess.run(
-            ["claude", "-p", "echo test", "--allowedTools", ""],
-            capture_output=True, text=True, timeout=15,
-        )
-        result = subprocess.run(
             ["claude", "skills", "list"],
             capture_output=True, text=True, timeout=15,
         )

@@ -5,7 +5,7 @@ from typing import Optional
 # Base tool sets
 _READ_ONLY = ["Read", "Glob", "Grep"]
 _READ_WRITE = ["Read", "Glob", "Grep", "Write", "Edit"]
-_ALL = ["Read", "Glob", "Grep", "Write", "Edit", "Bash", "Agent"]
+_ALL = ["Read", "Glob", "Grep", "Write", "Edit", "Bash", "Agent", "Task"]
 _GIT_ONLY = ["Read", "Glob", "Grep", "Bash"]
 
 # MCP tool patterns

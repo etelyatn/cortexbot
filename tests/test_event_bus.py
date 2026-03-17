@@ -23,7 +23,8 @@ class TestEventBus:
         await bus.emit("test.event", {"key": "value"})
 
         assert len(received) == 1
-        assert received[0] == {"key": "value"}
+        assert received[0]["key"] == "value"
+        assert received[0]["event_type"] == "test.event"
 
     async def test_multiple_subscribers(self) -> None:
         """Multiple handlers for same event all fire."""

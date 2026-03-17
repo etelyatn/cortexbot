@@ -10,6 +10,7 @@ User (Telegram) → CortexBot → Claude Code CLI → cortex-toolkit + cortex-mc
 
 - **Artifact-driven orchestration:** Brainstorm → Plan → Implement → Review → Test → Finish — each phase produces a concrete artifact that gates the next
 - **Freeform `/chat`:** Talk to Claude Code with full MCP access, outside the task pipeline
+- **Editor lifecycle:** Start, stop, and monitor the Unreal Editor directly from Telegram
 - **Telegram-native:** One thread per task, commands for control (`/task`, `/status`, `/cancel`, `/continue`, `/auto`, `/test`, `/answer`)
 - **Auto mode:** `/auto on` chains phases automatically, pausing only on escalation or budget limits
 - **Crash recovery:** Task state persisted to disk, dead subprocess PIDs detected and cleared on restart
@@ -24,25 +25,76 @@ User (Telegram) → CortexBot → Claude Code CLI → cortex-toolkit + cortex-mc
 - Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - Unreal Engine project with [UnrealCortex](https://github.com/etelyatn/UnrealCortex) plugin and [cortex-mcp](https://github.com/etelyatn/UnrealCortex/tree/main/MCP) server configured
 
-## Installation
+## Quick Start
 
 ```bash
-# Clone the repo
 git clone https://github.com/etelyatn/cortexbot.git
 cd cortexbot
-
-# Install dependencies
 uv sync --all-extras
-
-# Run the init wizard to configure bot directory, token, and projects
-uv run cortexbot init
+uv run cortexbot init     # Interactive setup wizard
+uv run cortexbot           # Start the bot
 ```
 
-The init wizard creates `~/.cortexbot/` with:
-- `config.yaml` — bot configuration
-- `.env` — Telegram bot token (loaded automatically on startup)
-- `tasks/` — persistent task state
-- `chats/` — chat session state
+## Project Model
+
+CortexBot manages **multiple Unreal Engine projects**. Each project is bound to a **Telegram group chat** — all commands in that group target that project.
+
+### How it works
+
+```
+Telegram Group A  ←→  Project "sandbox"   (D:/UnrealProjects/CortexSandbox)
+Telegram Group B  ←→  Project "shooter"   (D:/UnrealProjects/ShooterGame)
+Telegram Group C  ←→  Project "rpg"       (D:/UnrealProjects/RPGDemo)
+```
+
+- **One group = one project.** When you send `/task` in Group A, the bot knows it's for `sandbox`.
+- The binding is created when you run `/project_add` — the bot captures the group's chat ID automatically.
+- Each group is independent: tasks, chat sessions, and editor commands all scope to that group's project.
+
+### Setting up a new project
+
+1. **Create a Telegram group** for the project (or use an existing one with Topics enabled)
+2. **Add the bot** to the group
+3. **Register the project:**
+   ```
+   /project_add myproject D:/UnrealProjects/MyProject
+   ```
+   The bot validates: `.git` exists, `.mcp.json` exists, `CLAUDE.md` exists (cortex-toolkit installed)
+4. **Check health:**
+   ```
+   /project_validate
+   ```
+5. **Start the editor if needed:**
+   ```
+   /editor start
+   ```
+
+### Config file
+
+Projects can also be configured manually in `~/.cortexbot/config.yaml`:
+
+```yaml
+telegram:
+  bot_token: "${CORTEXBOT_TELEGRAM_TOKEN}"
+
+projects:
+  sandbox:
+    path: "D:/UnrealProjects/CortexSandbox"
+    mcp_config: ".mcp.json"
+    default_branch: "main"
+    group_id: -1001234567890    # Telegram group chat ID
+  shooter:
+    path: "D:/UnrealProjects/ShooterGame"
+    mcp_config: ".mcp.json"
+    default_branch: "main"
+    group_id: -1009876543210    # Different group
+
+defaults:
+  token_budget: 500000
+  max_cycles: 3
+  chat:
+    inactivity_timeout: 7200
+```
 
 ## Telegram Setup
 
@@ -70,6 +122,8 @@ The easiest way to find your group chat ID:
 3. Copy that number (including the `-100` prefix)
 4. Remove RawDataBot from the group
 
+Or just run `/project_add` — the bot captures the group ID automatically.
+
 ### 4. Set bot permissions
 
 In BotFather, send `/mybots` → select your bot → **Bot Settings**:
@@ -80,47 +134,33 @@ If using Topics, also grant the bot **admin rights** in the group so it can post
 
 </details>
 
-## Configuration
+## Commands
 
-After running `cortexbot init`, edit `~/.cortexbot/config.yaml` if needed:
+### Editor Management
 
-```yaml
-telegram:
-  bot_token: "${CORTEXBOT_TELEGRAM_TOKEN}"
-  group_id: -1001234567890
+| Command | Description |
+|---------|-------------|
+| `/editor` or `/editor status` | Show editor status (running, port, domains) |
+| `/editor start` | Start the Unreal Editor and wait for MCP connection |
+| `/editor stop` | Gracefully shut down the editor |
 
-projects:
-  sandbox:
-    path: "D:/UnrealProjects/CortexSandbox"
-    mcp_config: ".mcp.json"
-    default_branch: "main"
-    group_id: -1001234567890
+The editor auto-starts during task execution (cortex-toolkit's PreToolUse hook handles this). Use `/editor start` for explicit control or to pre-warm before creating tasks.
 
-defaults:
-  token_budget: 500000
-  max_cycles: 3
-  chat_inactivity_timeout: 7200
-```
+### Project Management
 
-## Usage
+| Command | Description |
+|---------|-------------|
+| `/project_add <name> <path>` | Register a project for this group |
+| `/project_validate` | Full health check (editor, git, MCP, CLAUDE.md) |
+| `/ping` | Check if the bot is alive |
 
-```bash
-# Start the bot
-uv run cortexbot
-
-# Or with explicit config path
-uv run cortexbot /path/to/config.yaml
-```
-
-### Task Commands
-
-In Telegram (inside your configured group):
+### Task Pipeline
 
 | Command | Description |
 |---------|-------------|
 | `/task <description>` | Create a new task, start artifact pipeline |
-| `/task <desc> --spec path` | Create task with existing spec (skip brainstorm) |
-| `/task <desc> --plan path` | Create task with existing plan (skip brainstorm + plan) |
+| `/task <desc> --spec path` | Skip brainstorm — use existing spec |
+| `/task <desc> --plan path` | Skip brainstorm + plan — use existing plan |
 | `/continue` | Execute the next action in the pipeline |
 | `/auto on\|off` | Toggle auto mode (chains actions automatically) |
 | `/cancel` | Kill running subprocess, pause or cancel task |
@@ -128,30 +168,17 @@ In Telegram (inside your configured group):
 | `/status` | Show current task state and artifacts |
 | `/budget [amount]` | Show or set token budget |
 | `/tasks` | List all active tasks |
+| `/test` | Run all tests (Unreal + Python) directly |
+| `/test Cortex.Data+` | Run specific Unreal test namespace |
+| `/test python` | Run Python tests only |
 
-### Chat Commands
+### Freeform Chat
 
 | Command | Description |
 |---------|-------------|
 | `/chat <message>` | Start or continue a freeform Claude Code session |
 | `/chat_end` | End the current chat session |
 | `/chat_history` | List active chat sessions |
-
-### Test Commands
-
-| Command | Description |
-|---------|-------------|
-| `/test` | Run all tests (Unreal + Python) directly |
-| `/test Cortex.Data+` | Run specific Unreal test namespace directly |
-| `/test python` | Run Python tests only |
-| `/test <instructions>` | Run tests via Claude Code (freeform) |
-
-### Project Commands
-
-| Command | Description |
-|---------|-------------|
-| `/project_add <name> <path>` | Register a project at runtime |
-| `/project_validate` | Health check (editor, git, MCP config) |
 
 ## Architecture
 
@@ -164,7 +191,7 @@ claude/        → CLI invocation, stream-json parsing, prompt builder
 memory/        → Filesystem task store, session records
 chat/          → Freeform chat sessions (separate from task pipeline)
 events/        → Event bus and Telegram notifications
-services/      → Unreal Engine health checks
+services/      → Unreal Editor lifecycle (status, start, stop, health)
 cli/           → Init wizard and CLI entry points
 config.py      → YAML config with env var interpolation
 ```
@@ -190,11 +217,8 @@ brainstorm → plan → implement → review → test → finish
 ## Development
 
 ```bash
-# Run tests
-uv run pytest tests/ -v
-
-# Run specific test module
-uv run pytest tests/test_stream_parser.py -v
+uv run pytest tests/ -v            # Run all tests
+uv run pytest tests/test_*.py -v   # Run specific module
 ```
 
 ## License

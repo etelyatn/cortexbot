@@ -42,8 +42,11 @@ class EventBus:
         if not handlers:
             return
 
+        # Inject event_type so handlers can format without knowing the subscription key
+        enriched = {**payload, "event_type": event}
+
         results = await asyncio.gather(
-            *(h(payload) for h in handlers), return_exceptions=True
+            *(h(enriched) for h in handlers), return_exceptions=True
         )
         for i, result in enumerate(results):
             if isinstance(result, Exception):

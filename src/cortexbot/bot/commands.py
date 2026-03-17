@@ -22,6 +22,8 @@ from cortexbot.claude.prompts import (
 )
 from cortexbot.claude.stream_parser import StatusBlock, parse_stream_line
 from cortexbot.memory.store import TaskStore
+from cortexbot.memory.session_rotation import should_rotate
+from cortexbot.chat.store import ChatSessionStore
 from cortexbot.config import BotConfig, add_project
 
 logger = logging.getLogger(__name__)
@@ -31,15 +33,17 @@ _CORTEX_NAMESPACE_RE = re.compile(r"^Cortex\.\w+\+$")
 # Module-level references set during bot init
 _config: BotConfig = None
 _task_store: TaskStore = None
+_chat_store: ChatSessionStore = None
 _session_manager: SessionManager = None
 _event_bus = None
 
 
-def init_commands(config, task_store, session_manager, event_bus):
+def init_commands(config, task_store, session_manager, event_bus, chat_store=None):
     """Wire up module-level dependencies."""
-    global _config, _task_store, _session_manager, _event_bus
+    global _config, _task_store, _chat_store, _session_manager, _event_bus
     _config = config
     _task_store = task_store
+    _chat_store = chat_store
     _session_manager = session_manager
     _event_bus = event_bus
 
@@ -94,6 +98,8 @@ async def cmd_project_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         errors.append("Missing .mcp.json")
     if not (project_path / ".git").exists():
         errors.append("Not a git repository")
+    if not (project_path / "CLAUDE.md").exists():
+        errors.append("Missing CLAUDE.md (cortex-toolkit not installed)")
 
     if errors:
         await update.message.reply_text("Validation failed:\n" + "\n".join(f"- {e}" for e in errors))
@@ -122,24 +128,117 @@ async def cmd_project_validate(update: Update, context: ContextTypes.DEFAULT_TYP
     name, proj = project
     checks = []
 
-    from cortexbot.services.unreal import check_ue_health
-    health = await check_ue_health(proj.path)
-    if health["connected"]:
-        checks.append("OK Editor running")
+    from cortexbot.services.unreal import check_editor_status
+    status = await check_editor_status(proj.path)
+    if status["running"]:
+        domains = ", ".join(status["domains"]) if status["domains"] else "none"
+        checks.append(f"OK Editor running (port {status['port']}, domains: {domains})")
     else:
-        checks.append(f"FAIL Editor: {health.get('error', 'not reachable')}")
+        hint = " Use `/editor` to start it." if status["can_start"] else ""
+        checks.append(f"FAIL Editor not running.{hint}")
 
     proc = await asyncio.create_subprocess_exec(
         "git", "status", "--porcelain",
         cwd=proj.path, stdout=asyncio.subprocess.PIPE,
     )
     stdout, _ = await proc.communicate()
-    checks.append("OK Git clean" if not stdout.strip() else "FAIL Git has uncommitted changes")
+    checks.append("OK Git clean" if not stdout.strip() else "WARN Git has uncommitted changes")
 
     mcp_path = Path(proj.path) / proj.mcp_config
     checks.append("OK MCP config exists" if mcp_path.exists() else "FAIL MCP config not found")
 
+    claude_md = Path(proj.path) / "CLAUDE.md"
+    checks.append("OK CLAUDE.md present" if claude_md.exists() else "WARN CLAUDE.md missing")
+
     await update.message.reply_text(f"Project `{name}` health:\n" + "\n".join(checks))
+
+
+# -- /editor -----------------------------------------------------------------
+
+async def cmd_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/editor [start|stop|status] — manage the Unreal Editor for this project."""
+    project = _resolve_project(update.effective_chat.id)
+    if not project:
+        await update.message.reply_text("No project for this group.")
+        return
+
+    name, proj = project
+    args = context.args or []
+    subcommand = args[0] if args else "status"
+
+    from cortexbot.services.unreal import check_editor_status, start_editor
+
+    if subcommand == "status":
+        status = await check_editor_status(proj.path)
+        if status["running"]:
+            domains = ", ".join(status["domains"]) if status["domains"] else "none"
+            lines = [
+                f"Editor: running",
+                f"Port: {status['port']}",
+                f"PID: {status['pid']}",
+                f"Domains: {domains}",
+            ]
+        else:
+            lines = ["Editor: not running"]
+            if status["port"]:
+                lines.append(f"Port file found (port {status['port']}) but TCP not responding")
+            if status["can_start"]:
+                lines.append("Use `/editor start` to launch")
+            else:
+                missing = []
+                if not status["engine_path"]:
+                    missing.append("UE_56_PATH env var not set")
+                if not status["uproject"]:
+                    missing.append("no .uproject found")
+                lines.append(f"Cannot auto-start: {', '.join(missing)}")
+        await update.message.reply_text("\n".join(lines))
+
+    elif subcommand == "start":
+        # Check if already running
+        status = await check_editor_status(proj.path)
+        if status["running"]:
+            await update.message.reply_text(
+                f"Editor already running on port {status['port']}."
+            )
+            return
+
+        if not status["can_start"]:
+            missing = []
+            if not status["engine_path"]:
+                missing.append("UE_56_PATH not set")
+            if not status["uproject"]:
+                missing.append("no .uproject found")
+            await update.message.reply_text(f"Cannot start: {', '.join(missing)}")
+            return
+
+        await update.message.reply_text("Starting editor... (30-90 seconds typically)")
+        result = await start_editor(proj.path)
+        if result["started"]:
+            domains = ", ".join(result["domains"]) if result.get("domains") else "none"
+            await update.message.reply_text(
+                f"Editor started in {result['elapsed_seconds']}s\n"
+                f"Port: {result['port']}\n"
+                f"Domains: {domains}"
+            )
+        else:
+            await update.message.reply_text(f"Failed: {result.get('error', 'unknown')}")
+
+    elif subcommand == "stop":
+        status = await check_editor_status(proj.path)
+        if not status["running"]:
+            await update.message.reply_text("Editor is not running.")
+            return
+
+        from cortexbot.services.unreal import run_ue_command
+        try:
+            await run_ue_command(proj.path, "core", "shutdown", {"force": True})
+            await update.message.reply_text("Shutdown command sent.")
+        except Exception as e:
+            # Expected — editor closes socket during shutdown
+            await update.message.reply_text("Shutdown initiated.")
+
+    else:
+        await update.message.reply_text("Usage: /editor [start|stop|status]")
 
 
 # -- /task -------------------------------------------------------------------
@@ -196,7 +295,10 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     _task_store.save_task(task)
-    await _event_bus.emit("task.created", {"task_id": task_id, "description": description})
+    await _event_bus.emit("task.created", {
+        "task_id": task_id, "description": description,
+        "chat_id": task.telegram_chat_id, "thread_id": task.telegram_thread_id,
+    })
 
     action = task.next_action
     await update.message.reply_text(
@@ -217,10 +319,23 @@ async def cmd_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     action = task.next_action
     if action in ("paused", "budget-exceeded", "escalate"):
-        await update.message.reply_text(f"Task is {action}. Cannot continue.")
+        if task.brainstorm_questions:
+            await update.message.reply_text(
+                "Task is paused waiting for answers to brainstorm questions. "
+                "Use `/answer <your answers>` to continue."
+            )
+        else:
+            await update.message.reply_text(f"Task is {action}. Cannot continue.")
         return
 
     await _run_action(update, task, action)
+
+    # Auto mode: iterate (not recurse) until we hit a stopping point
+    while task.auto_mode and task.status == "active":
+        next_act = task.next_action
+        if next_act in ("paused", "budget-exceeded", "escalate", "brainstorm"):
+            break
+        await _run_action(update, task, next_act)
 
 
 async def _run_action(update: Update, task: TaskState, action: str, user_input: str = ""):
@@ -281,7 +396,10 @@ async def _run_action(update: Update, task: TaskState, action: str, user_input: 
         task.sessions.append(record)
         _task_store.save_task(task)
 
-        await _event_bus.emit("session.started", {"task_id": task.task_id, "action": action})
+        await _event_bus.emit("session.started", {
+            "task_id": task.task_id, "action": action,
+            "chat_id": task.telegram_chat_id, "thread_id": task.telegram_thread_id,
+        })
 
         process = await run_claude(invocation)
         task.subprocess_pid = process.pid
@@ -292,6 +410,9 @@ async def _run_action(update: Update, task: TaskState, action: str, user_input: 
         status_block = None
         total_tokens = 0
         last_assistant_text = ""
+        event_count = 0
+        rotated = False
+        rotation_threshold = _config.defaults.session_rotation.get("execute", 100)
         async for raw_line in process.stdout:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
@@ -299,19 +420,26 @@ async def _run_action(update: Update, task: TaskState, action: str, user_input: 
             event = parse_stream_line(line)
             if event is None:
                 continue
+            event_count += 1
             if event.type == "result" and event.input_tokens > 0:
                 total_tokens = event.input_tokens + event.output_tokens
             if event.type == "assistant" and event.text:
                 last_assistant_text += event.text
                 if len(last_assistant_text) > 10000:
                     last_assistant_text = last_assistant_text[-10000:]
+            # Session rotation check for long-running execute actions
+            if should_rotate(action, event_count, rotation_threshold):
+                logger.info("Session rotation triggered for task %s at %d events", task.task_id, event_count)
+                rotated = True
+                _session_manager.kill_subprocess()
+                break
 
         await process.wait()
 
         status_block = StatusBlock.from_text(last_assistant_text)
 
         record.ended_at = datetime.now(timezone.utc).isoformat()
-        record.exit_reason = "completed" if process.returncode == 0 else "crash"
+        record.exit_reason = "rotated" if rotated else ("completed" if process.returncode == 0 else "crash")
         record.tokens_used = total_tokens
         task.tokens_used += total_tokens
         task.subprocess_pid = None
@@ -330,6 +458,9 @@ async def _run_action(update: Update, task: TaskState, action: str, user_input: 
                     f"{questions_text}\n\n"
                     f"Reply with `/answer <your answers>` to continue."
                 )
+        elif rotated:
+            # Session rotation: don't pause — the same action will re-run via auto-mode or /continue
+            await update.message.reply_text(f"Session rotated after {event_count} events. Continuing...")
         elif process.returncode != 0:
             task.last_error = f"No status block. Exit code: {process.returncode}"
             task.status = "paused"
@@ -340,6 +471,7 @@ async def _run_action(update: Update, task: TaskState, action: str, user_input: 
         await _event_bus.emit("session.completed", {
             "task_id": task.task_id, "action": action,
             "exit_reason": record.exit_reason,
+            "chat_id": task.telegram_chat_id, "thread_id": task.telegram_thread_id,
         })
 
         next_act = task.next_action
@@ -350,13 +482,6 @@ async def _run_action(update: Update, task: TaskState, action: str, user_input: 
 
     finally:
         _session_manager.release()
-
-    # Auto mode chaining
-    while task.auto_mode:
-        next_act = task.next_action
-        if next_act in ("paused", "budget-exceeded", "escalate", "brainstorm"):
-            break
-        await _run_action(update, task, next_act)
 
 
 def _apply_status_block(task: TaskState, action: str, block: StatusBlock):
@@ -391,6 +516,13 @@ def _apply_status_block(task: TaskState, action: str, block: StatusBlock):
             if not task.review_result.passed:
                 task.review_cycle += 1
                 task.implementation_complete = False
+        elif action == "test":
+            task.test_result = TestResult(
+                passed=True,
+                summary=block.summary or "",
+                failed_tests=[],
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
         elif action == "finish":
             task.status = "completed"
 
@@ -569,10 +701,7 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id or update.message.message_id
 
     # Find or create chat session
-    from cortexbot.chat.store import ChatSessionStore
-    chat_store = ChatSessionStore(base_dir=Path.home() / ".cortexbot")
-
-    existing = chat_store.find_by_thread(update.effective_chat.id, thread_id)
+    existing = _chat_store.find_by_thread(update.effective_chat.id, thread_id)
     is_resume = existing is not None
 
     if existing:
@@ -585,8 +714,11 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             telegram_chat_id=update.effective_chat.id,
             telegram_thread_id=thread_id,
         )
-        chat_store.save(session)
-        await _event_bus.emit("chat.started", {"session_id": session.session_id, "project": name})
+        _chat_store.save(session)
+        await _event_bus.emit("chat.started", {
+            "session_id": session.session_id, "project": name,
+            "chat_id": update.effective_chat.id, "thread_id": thread_id,
+        })
 
     # Acquire session mutex
     try:
@@ -608,7 +740,7 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         process = await run_claude(invocation)
         session.subprocess_pid = process.pid
         _session_manager.current_pid = process.pid
-        chat_store.save(session)
+        _chat_store.save(session)
 
         # Collect response
         response_text = ""
@@ -632,7 +764,7 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.subprocess_pid = None
         from datetime import datetime, timezone
         session.last_activity = datetime.now(timezone.utc).isoformat()
-        chat_store.save(session)
+        _chat_store.save(session)
 
         # Send response (truncate if too long for Telegram)
         if response_text:
@@ -651,10 +783,7 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_chat_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """End the current chat session."""
     thread_id = update.message.message_thread_id or update.message.message_id
-
-    from cortexbot.chat.store import ChatSessionStore
-    chat_store = ChatSessionStore(base_dir=Path.home() / ".cortexbot")
-    session = chat_store.find_by_thread(update.effective_chat.id, thread_id)
+    session = _chat_store.find_by_thread(update.effective_chat.id, thread_id)
 
     if not session:
         await update.message.reply_text("No active chat session in this thread.")
@@ -663,8 +792,9 @@ async def cmd_chat_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _event_bus.emit("chat.ended", {
         "session_id": session.session_id,
         "message_count": session.message_count,
+        "chat_id": update.effective_chat.id, "thread_id": thread_id,
     })
-    chat_store.delete(session.session_id)
+    _chat_store.delete(session.session_id)
     await update.message.reply_text(
         f"Chat ended. {session.message_count} messages, {session.tokens_used:,} tokens."
     )
@@ -674,9 +804,7 @@ async def cmd_chat_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_chat_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List active chat sessions."""
-    from cortexbot.chat.store import ChatSessionStore
-    chat_store = ChatSessionStore(base_dir=Path.home() / ".cortexbot")
-    sessions = chat_store.list_sessions()
+    sessions = _chat_store.list_sessions()
 
     if not sessions:
         await update.message.reply_text("No active chat sessions.")
