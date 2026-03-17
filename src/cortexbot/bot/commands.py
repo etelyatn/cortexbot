@@ -26,6 +26,8 @@ from cortexbot.config import BotConfig, add_project
 
 logger = logging.getLogger(__name__)
 
+_CORTEX_NAMESPACE_RE = re.compile(r"^Cortex\.\w+\+$")
+
 # Module-level references set during bot init
 _config: BotConfig = None
 _task_store: TaskStore = None
@@ -684,3 +686,117 @@ async def cmd_chat_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in sessions:
         lines.append(f"• [{s.session_id[:8]}] {s.project} — {s.message_count} msgs, {s.tokens_used:,} tokens")
     await update.message.reply_text("\n".join(lines))
+
+
+# ── /test ─────────────────────────────────────────────────
+
+def _is_direct_test_pattern(args: list[str]) -> bool:
+    """Check if test args match known direct execution patterns."""
+    if not args:
+        return True
+    if args == ["python"]:
+        return True
+    return all(_CORTEX_NAMESPACE_RE.match(a) for a in args)
+
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/test [args] — run tests directly or via Claude Code."""
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task = _get_task_for_thread(update.effective_chat.id, thread_id)
+    if not task:
+        await update.message.reply_text("No active task in this thread.")
+        return
+
+    project = _config.projects.get(task.project)
+    if not project:
+        await update.message.reply_text(f"Project `{task.project}` not found.")
+        return
+
+    args = context.args or []
+
+    if _is_direct_test_pattern(args):
+        await _run_direct_tests(update, task, project, args)
+    else:
+        user_input = " ".join(args)
+        await _run_action(update, task, "test", user_input=user_input)
+
+
+async def _run_direct_tests(update, task, project, args):
+    """Run tests directly via RunTests.ps1 or pytest."""
+    await update.message.reply_text("Running tests...")
+
+    outputs = []
+    all_passed = True
+
+    if args == ["python"]:
+        proc = await asyncio.create_subprocess_exec(
+            "uv", "run", "pytest", "tests/", "-v",
+            cwd=str(Path(project.path) / "Plugins" / "UnrealCortex" / "MCP"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        outputs.append(("Python", stdout.decode(errors="replace"), proc.returncode == 0))
+        if proc.returncode != 0:
+            all_passed = False
+    elif not args:
+        ue_proc = await asyncio.create_subprocess_exec(
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", f"& {{ Set-Location '{project.path}/cli/Testing'; .\\RunTests.ps1 'Cortex+' }}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        ue_stdout, _ = await ue_proc.communicate()
+        outputs.append(("Unreal", ue_stdout.decode(errors="replace"), ue_proc.returncode == 0))
+        if ue_proc.returncode != 0:
+            all_passed = False
+
+        py_proc = await asyncio.create_subprocess_exec(
+            "uv", "run", "pytest", "tests/", "-v",
+            cwd=str(Path(project.path) / "Plugins" / "UnrealCortex" / "MCP"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        py_stdout, _ = await py_proc.communicate()
+        outputs.append(("Python", py_stdout.decode(errors="replace"), py_proc.returncode == 0))
+        if py_proc.returncode != 0:
+            all_passed = False
+    else:
+        namespaces = " ".join(args)
+        proc = await asyncio.create_subprocess_exec(
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", f"& {{ Set-Location '{project.path}/cli/Testing'; .\\RunTests.ps1 '{namespaces}' }}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        outputs.append(("Unreal", stdout.decode(errors="replace"), proc.returncode == 0))
+        if proc.returncode != 0:
+            all_passed = False
+
+    combined = "\n".join(f"=== {name} ===\n{out}" for name, out, _ in outputs)
+
+    task.test_result = TestResult(
+        passed=all_passed,
+        summary=combined[-200:] if len(combined) > 200 else combined,
+        failed_tests=_extract_failed_tests(combined) if not all_passed else [],
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+    if not all_passed:
+        task.test_cycle += 1
+        task.implementation_complete = False
+    _task_store.save_task(task)
+
+    from cortexbot.bot.media import chunk_message
+    status = "PASSED" if all_passed else "FAILED"
+    for chunk in chunk_message(f"Tests {status}\n\n{combined}"):
+        await update.message.reply_text(chunk)
+
+
+def _extract_failed_tests(output: str) -> list[str]:
+    """Extract failed test names from test output."""
+    failed = []
+    for line in output.splitlines():
+        if "FAILED" in line or "FAIL" in line:
+            failed.append(line.strip())
+    return failed[:20]

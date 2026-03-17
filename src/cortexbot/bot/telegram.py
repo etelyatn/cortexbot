@@ -9,7 +9,7 @@ from cortexbot.bot.commands import (
     cmd_ping, cmd_task, cmd_continue, cmd_cancel, cmd_status,
     cmd_budget, cmd_tasks, cmd_auto, cmd_project_add,
     cmd_project_validate, cmd_answer, cmd_chat, cmd_chat_end,
-    cmd_chat_history, init_commands,
+    cmd_chat_history, cmd_test, init_commands,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,9 @@ def create_application(config, event_bus, task_store=None, session_manager=None)
     app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_handler(CommandHandler("chat_end", cmd_chat_end))
     app.add_handler(CommandHandler("chat_history", cmd_chat_history))
+
+    # Testing
+    app.add_handler(CommandHandler("test", cmd_test))
 
     # Monitoring
     app.add_handler(CommandHandler("status", cmd_status))
