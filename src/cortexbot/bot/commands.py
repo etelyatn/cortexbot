@@ -1,811 +1,546 @@
-"""Telegram command handlers.
-
-Each command function is registered as a CommandHandler in telegram.py.
-Commands are implemented incrementally across milestones.
-"""
-
-from __future__ import annotations
+"""V2 Telegram command handlers."""
 
 import asyncio
 import logging
-import uuid
-from dataclasses import dataclass
+import re
+import uuid as _uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Coroutine
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from cortexbot.claude.cli import build_invocation, run_claude
-from cortexbot.claude.stream_parser import parse_stream_line, StatusBlock
-from cortexbot.config import BotConfig
-from cortexbot.events.bus import EventBus
-from cortexbot.health.preflight import check_editor_alive, check_git_branch
-from cortexbot.log import InvocationLogger
-from cortexbot.memory.store import TaskStore
-from cortexbot.orchestrator.phase_tools import get_allowed_tools
+from cortexbot.orchestrator.task_manager import (
+    TaskState, ReviewResult, TestResult, SessionRecord,
+)
+from cortexbot.orchestrator.action_tools import get_allowed_tools
 from cortexbot.orchestrator.session_manager import SessionManager
-from cortexbot.orchestrator.task_manager import TaskState, PhaseRecord, next_phase, PHASES
-from cortexbot.bot.media import chunk_message
+from cortexbot.claude.cli import build_invocation, run_claude
+from cortexbot.claude.prompts import (
+    build_prompt, STATUS_BLOCK_CONTRACT, FENCE_INSTRUCTION,
+    BRAINSTORM_BATCH_INSTRUCTION,
+)
+from cortexbot.claude.stream_parser import StatusBlock, parse_stream_line
+from cortexbot.memory.store import TaskStore
+from cortexbot.config import BotConfig, add_project
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class TaskArgs:
-    """Parsed /task command arguments."""
-
-    title: str
-    project: str | None = None
-    autonomy: str | None = None
+# Module-level references set during bot init
+_config: BotConfig = None
+_task_store: TaskStore = None
+_session_manager: SessionManager = None
+_event_bus = None
 
 
-def parse_task_args(text: str) -> TaskArgs:
-    """Parse /task arguments: title [--project X] [--autonomy Y].
+def init_commands(config, task_store, session_manager, event_bus):
+    """Wire up module-level dependencies."""
+    global _config, _task_store, _session_manager, _event_bus
+    _config = config
+    _task_store = task_store
+    _session_manager = session_manager
+    _event_bus = event_bus
 
-    Args:
-        text: Raw argument text after /task
 
-    Returns:
-        Parsed TaskArgs
+def _resolve_project(chat_id: int):
+    """Resolve project for a group chat. Returns (name, project_config) or None."""
+    for name, proj in _config.projects.items():
+        if proj.group_id == chat_id:
+            return (name, proj)
+    return None
 
-    Raises:
-        ValueError: If title is empty
-    """
-    parts = text.strip().split()
-    if not parts:
-        raise ValueError("Task title is required")
 
-    title_parts: list[str] = []
-    project: str | None = None
-    autonomy: str | None = None
+def _get_task_for_thread(chat_id: int, thread_id: int):
+    """Find active task for this Telegram thread."""
+    task = _task_store.load_task(str(thread_id))
+    if task and task.telegram_chat_id == chat_id:
+        return task
+    return None
 
+
+def _slugify(text: str, max_len: int = 30) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len]
+
+
+def _fence_user_message(message: str) -> str:
+    """Wrap user message in UUID-fenced delimiters for prompt injection mitigation."""
+    fence_id = str(_uuid.uuid4())
+    return (
+        f"--- USER MESSAGE [{fence_id}] ---\n"
+        f"{message}\n"
+        f"--- END USER MESSAGE [{fence_id}] ---"
+    )
+
+
+# -- /project-add ----------------------------------------------------------
+
+async def cmd_project_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Register a project: /project_add <name> <path>"""
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /project_add <name> <path>")
+        return
+
+    name, path_str = args[0], " ".join(args[1:])
+    project_path = Path(path_str)
+
+    errors = []
+    if not project_path.exists():
+        errors.append(f"Path does not exist: {path_str}")
+    if not (project_path / ".mcp.json").exists():
+        errors.append("Missing .mcp.json")
+    if not (project_path / ".git").exists():
+        errors.append("Not a git repository")
+
+    if errors:
+        await update.message.reply_text("Validation failed:\n" + "\n".join(f"- {e}" for e in errors))
+        return
+
+    chat_id = update.effective_chat.id
+    config_path = Path.home() / ".cortexbot" / "config.yaml"
+    add_project(config_path, name, path_str, chat_id)
+
+    from cortexbot.config import load_config
+    global _config
+    _config = load_config(config_path)
+
+    await update.message.reply_text(f"Project `{name}` registered.")
+
+
+# -- /project-validate ------------------------------------------------------
+
+async def cmd_project_validate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full runtime health check."""
+    project = _resolve_project(update.effective_chat.id)
+    if not project:
+        await update.message.reply_text("No project registered for this group.")
+        return
+
+    name, proj = project
+    checks = []
+
+    from cortexbot.services.unreal import check_ue_health
+    health = await check_ue_health(proj.path)
+    if health["connected"]:
+        checks.append("OK Editor running")
+    else:
+        checks.append(f"FAIL Editor: {health.get('error', 'not reachable')}")
+
+    proc = await asyncio.create_subprocess_exec(
+        "git", "status", "--porcelain",
+        cwd=proj.path, stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    checks.append("OK Git clean" if not stdout.strip() else "FAIL Git has uncommitted changes")
+
+    mcp_path = Path(proj.path) / proj.mcp_config
+    checks.append("OK MCP config exists" if mcp_path.exists() else "FAIL MCP config not found")
+
+    await update.message.reply_text(f"Project `{name}` health:\n" + "\n".join(checks))
+
+
+# -- /task -------------------------------------------------------------------
+
+async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/task <description> [--spec path] [--plan path]"""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /task <description> [--spec path] [--plan path]")
+        return
+
+    project = _resolve_project(update.effective_chat.id)
+    if not project:
+        await update.message.reply_text("No project for this group.")
+        return
+
+    name, proj = project
+
+    spec_path = None
+    plan_path = None
+    desc_parts = []
     i = 0
-    while i < len(parts):
-        if parts[i] == "--project" and i + 1 < len(parts):
-            project = parts[i + 1]
+    while i < len(args):
+        if args[i] == "--spec" and i + 1 < len(args):
+            spec_path = args[i + 1]
             i += 2
-        elif parts[i] == "--autonomy" and i + 1 < len(parts):
-            autonomy = parts[i + 1]
+        elif args[i] == "--plan" and i + 1 < len(args):
+            plan_path = args[i + 1]
             i += 2
-        elif parts[i].startswith("--"):
-            i += 1  # skip unknown flags
         else:
-            title_parts.append(parts[i])
+            desc_parts.append(args[i])
             i += 1
 
-    title = " ".join(title_parts).strip()
-    if not title:
-        raise ValueError("Task title is required")
+    description = " ".join(desc_parts)
+    if not description:
+        await update.message.reply_text("Please provide a task description.")
+        return
 
-    return TaskArgs(title=title, project=project, autonomy=autonomy)
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task_id = str(thread_id)
+
+    task = TaskState(
+        task_id=task_id,
+        project=name,
+        description=description,
+        spec_path=spec_path,
+        plan_path=plan_path,
+        token_budget=_config.defaults.token_budget,
+        max_cycles=_config.defaults.max_cycles,
+        telegram_chat_id=update.effective_chat.id,
+        telegram_thread_id=thread_id,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    _task_store.save_task(task)
+    await _event_bus.emit("task.created", {"task_id": task_id, "description": description})
+
+    action = task.next_action
+    await update.message.reply_text(
+        f"Task created. Next action: `{action}`\n"
+        f"Use `/continue` to start or `/auto on` for autonomous mode."
+    )
 
 
-async def _safe_run_task(
-    coro: Coroutine[Any, Any, None],
-    event_bus: EventBus,
-    thread_id: int,
-) -> None:
-    """Wrapper for fire-and-forget tasks — catches and reports exceptions."""
+# -- /continue ---------------------------------------------------------------
+
+async def cmd_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Execute the next action for the task in this thread."""
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task = _get_task_for_thread(update.effective_chat.id, thread_id)
+    if not task:
+        await update.message.reply_text("No active task in this thread.")
+        return
+
+    action = task.next_action
+    if action in ("paused", "budget-exceeded", "escalate"):
+        await update.message.reply_text(f"Task is {action}. Cannot continue.")
+        return
+
+    await _run_action(update, task, action)
+
+
+async def _run_action(update: Update, task: TaskState, action: str, user_input: str = ""):
+    """Spawn a Claude Code session for the given action."""
+    project = _config.projects.get(task.project)
+    if not project:
+        await update.message.reply_text(f"Project `{task.project}` not found.")
+        return
+
     try:
-        await coro
-    except Exception:
-        logger.exception("Task loop crashed for thread %d", thread_id)
-        await event_bus.emit("escalation.needed", {
-            "event_type": "escalation.needed",
-            "thread_id": thread_id,
-            "phase": "unknown",
-            "reason": "Internal error — task loop crashed. Check bot logs.",
-        })
+        await _session_manager.try_acquire(subprocess_type="task")
+    except RuntimeError as e:
+        await update.message.reply_text(str(e))
+        return
 
-
-async def _create_task_branch(project_path: str, branch: str, default_branch: str) -> bool:
-    """Create and checkout a new task branch.
-
-    Uses asyncio subprocess to avoid blocking the event loop.
-    Returns True on success, False on failure.
-    """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "checkout", default_branch,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=project_path,
+        await update.message.reply_text(f"Running: `{action}`...")
+
+        # Branch creation for implement
+        if action == "implement" and not task.branch_name:
+            slug = _slugify(task.description)
+            branch = f"task/{task.task_id}-{slug}"
+            proc = await asyncio.create_subprocess_exec(
+                "git", "checkout", "-b", branch,
+                cwd=project.path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            task.branch_name = branch
+            _task_store.save_task(task)
+
+        prompt = build_prompt(task, action, user_input=user_input)
+
+        system_appendix = FENCE_INSTRUCTION + "\n\n" + STATUS_BLOCK_CONTRACT
+        if action == "brainstorm":
+            system_appendix += "\n\n" + BRAINSTORM_BATCH_INSTRUCTION
+
+        session_id = str(_uuid.uuid4())
+        allowed_tools = get_allowed_tools(action)
+
+        invocation = build_invocation(
+            prompt=prompt,
+            session_id=session_id,
+            action=action,
+            mcp_config=project.mcp_config,
+            system_prompt_appendix=system_appendix if action != "chat" else None,
+            allowed_tools=allowed_tools,
         )
-        await asyncio.wait_for(proc.wait(), timeout=10)
+        invocation.cwd = project.path
 
-        proc = await asyncio.create_subprocess_exec(
-            "git", "checkout", "-b", branch,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=project_path,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=10)
-        return proc.returncode == 0
-    except (OSError, asyncio.TimeoutError) as e:
-        logger.error("Failed to create branch %s: %s", branch, e)
-        return False
-
-
-async def _run_phase_once(
-    task: TaskState,
-    store: TaskStore,
-    session_mgr: SessionManager,
-    event_bus: EventBus,
-    config: BotConfig,
-    prompts_dir: Path,
-    inv_logger: InvocationLogger,
-) -> "StatusBlock | None":
-    """Execute a single Claude Code invocation for the current phase.
-
-    Acquires and releases the mutex. Returns the status block from Claude,
-    or None if cancelled.
-    """
-    project_config = config.projects[task.project]
-    project_path = str(project_config.path)
-
-    # Build prompt
-    template_file = prompts_dir / f"{task.current_phase}_phase.md"
-    if template_file.exists():
-        template = load_template(template_file)
-    else:
-        template = f"Execute the {task.current_phase} phase for task: {{{{title}}}}"
-
-    autonomy_file = prompts_dir / f"{task.autonomy}.md"
-    autonomy_rules = load_template(autonomy_file) if autonomy_file.exists() else ""
-
-    prompt_vars = {
-        "project_name": task.project,
-        "branch": task.branch,
-        "title": task.title,
-        "autonomy_rules": autonomy_rules,
-        "phase_history": "\n".join(
-            f"- {r.phase}: {r.summary}" for r in task.phase_history
-        ),
-        "error_context": task.last_error or "",
-    }
-
-    for artifact in task.artifacts:
-        if artifact.artifact_type == "design_doc":
-            prompt_vars["design_doc_path"] = artifact.path
-        elif artifact.artifact_type == "impl_guide":
-            prompt_vars["impl_guide_path"] = artifact.path
-
-    system_prompt = build_prompt(template, **prompt_vars)
-
-    # Session decision
-    if task.retry_count == 1 and task.session_id:
-        resume_id = task.session_id
-        session_id = None
-    else:
-        resume_id = None
-        session_id = str(uuid.uuid4())
         task.session_id = session_id
+        record = SessionRecord(
+            session_id=session_id,
+            action=action,
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        task.sessions.append(record)
+        _task_store.save_task(task)
 
-    invocation = build_invocation(
-        binary=config.claude.binary,
-        prompt=f"Execute the {task.current_phase} phase for: {task.title}",
-        project_path=project_path,
-        session_id=session_id,
-        resume_session_id=resume_id,
-        system_prompt=system_prompt,
-        max_budget_usd=task.calculate_phase_budget(),
-        allowed_tools=get_allowed_tools(task.current_phase),
-        mcp_config=project_config.mcp_config,
-    )
-
-    # Create invocation log
-    log_path = inv_logger.create_log(task.thread_id, task.current_phase)
-
-    # Preflight checks
-    editor_check = check_editor_alive(project_config.path)
-    if not editor_check.passed:
-        return StatusBlock(status="escalate", reason=f"Preflight failed: {editor_check.reason}")
-
-    branch_check = check_git_branch(project_config.path, task.branch)
-    if not branch_check.passed:
-        return StatusBlock(status="escalate", reason=f"Preflight failed: {branch_check.reason}")
-
-    # Phase timeout from config
-    timeout_secs = config.defaults.timeouts.get(
-        task.current_phase, config.defaults.timeouts.get("default", 900)
-    )
-
-    # Clear any stale cancel flag from a previous cancellation
-    session_mgr.clear_cancel()
-
-    await session_mgr.acquire()
-    try:
-        task.current_phase_status = "in_progress"
-        store.save_task(task)
-
-        await event_bus.emit("phase.started", {
-            "event_type": "phase.started",
-            "thread_id": task.thread_id,
-            "phase": task.current_phase,
-        })
+        await _event_bus.emit("session.started", {"task_id": task.task_id, "action": action})
 
         process = await run_claude(invocation)
         task.subprocess_pid = process.pid
-        store.save_task(task)
-        session_mgr.current_pid = process.pid
+        _session_manager.current_pid = process.pid
+        _task_store.save_task(task)
 
+        # Parse stream
+        status_block = None
+        total_tokens = 0
         last_assistant_text = ""
-        event_count = 0
-        cost_usd = 0.0
+        async for raw_line in process.stdout:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            event = parse_stream_line(line)
+            if event is None:
+                continue
+            if event.type == "result" and event.input_tokens > 0:
+                total_tokens = event.input_tokens + event.output_tokens
+            if event.type == "assistant" and event.text:
+                last_assistant_text += event.text
+                if len(last_assistant_text) > 10000:
+                    last_assistant_text = last_assistant_text[-10000:]
 
-        async def _read_stream() -> None:
-            nonlocal last_assistant_text, event_count, cost_usd
-            async for raw_line in process.stdout:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                inv_logger.append_line(log_path, line)
-                event = parse_stream_line(line)
-                if event is None:
-                    continue
-                if event.counts_for_rotation:
-                    event_count += 1
-                if event.type == "assistant" and event.text:
-                    last_assistant_text = event.text
-                if event.type == "result" and event.cost_usd is not None:
-                    cost_usd = event.cost_usd
-                if session_mgr.cancel_requested:
-                    session_mgr.kill_subprocess()
-                    break
+        await process.wait()
 
-        try:
-            await asyncio.wait_for(_read_stream(), timeout=timeout_secs)
-        except asyncio.TimeoutError:
-            session_mgr.kill_subprocess()
-            task.subprocess_pid = None
-            session_mgr.current_pid = None
-            task.current_phase_status = "interrupted"
-            store.save_task(task)
-            await event_bus.emit("escalation.needed", {
-                "event_type": "escalation.needed",
-                "thread_id": task.thread_id,
-                "phase": task.current_phase,
-                "reason": f"Phase timed out after {timeout_secs}s",
-            })
-            return None
-
-        return_code = await process.wait()
-
-        task.subprocess_pid = None
-        task.session_event_count = event_count
-        session_mgr.current_pid = None
-
-        if cost_usd > 0:
-            task.deduct_cost(cost_usd)
-
-        # Cancelled
-        if session_mgr.cancel_requested:
-            task.current_phase_status = "interrupted"
-            session_mgr.clear_cancel()
-            store.save_task(task)
-            await event_bus.emit("phase.cancelled", {
-                "event_type": "phase.cancelled",
-                "thread_id": task.thread_id,
-                "phase": task.current_phase,
-            })
-            return None
-
-        # Extract status block
         status_block = StatusBlock.from_text(last_assistant_text)
-        if status_block is None:
-            if return_code == 0:
-                status_block = StatusBlock(
-                    status="complete",
-                    summary=last_assistant_text[:200] if last_assistant_text else "Phase completed",
-                )
-            else:
-                status_block = StatusBlock(
-                    status="escalate",
-                    reason=f"No status block produced. Exit code: {return_code}",
-                )
 
-        store.save_task(task)
-        return status_block
+        record.ended_at = datetime.now(timezone.utc).isoformat()
+        record.exit_reason = "completed" if process.returncode == 0 else "crash"
+        record.tokens_used = total_tokens
+        task.tokens_used += total_tokens
+        task.subprocess_pid = None
+        task.session_id = None
+
+        if status_block:
+            _apply_status_block(task, action, status_block)
+
+            # Relay brainstorm questions
+            if action == "brainstorm" and task.brainstorm_questions:
+                questions_text = "\n".join(
+                    f"{i+1}. {q}" for i, q in enumerate(task.brainstorm_questions)
+                )
+                await update.message.reply_text(
+                    f"Before creating the spec, I have some questions:\n\n"
+                    f"{questions_text}\n\n"
+                    f"Reply with `/answer <your answers>` to continue."
+                )
+        elif process.returncode != 0:
+            task.last_error = f"No status block. Exit code: {process.returncode}"
+            task.status = "paused"
+
+        task.updated_at = datetime.now(timezone.utc).isoformat()
+        _task_store.save_task(task)
+
+        await _event_bus.emit("session.completed", {
+            "task_id": task.task_id, "action": action,
+            "exit_reason": record.exit_reason,
+        })
+
+        next_act = task.next_action
+        await update.message.reply_text(
+            f"Action `{action}` complete. Next: `{next_act}`\n"
+            f"Tokens used: {task.tokens_used:,} / {task.token_budget:,}"
+        )
 
     finally:
-        session_mgr.current_pid = None
-        session_mgr.release()
+        _session_manager.release()
+
+    # Auto mode chaining
+    while task.auto_mode:
+        next_act = task.next_action
+        if next_act in ("paused", "budget-exceeded", "escalate", "brainstorm"):
+            break
+        await _run_action(update, task, next_act)
 
 
-async def _run_task_loop(
-    task: TaskState,
-    store: TaskStore,
-    session_mgr: SessionManager,
-    event_bus: EventBus,
-    config: BotConfig,
-    prompts_dir: Path,
-) -> None:
-    """Orchestration loop: run phases, handle retries and advances."""
-    base_dir = Path.home() / ".cortexbot"
-    inv_logger = InvocationLogger(base_dir)
-    previous_error: str | None = None
-
-    while True:
-        status_block = await _run_phase_once(
-            task, store, session_mgr, event_bus, config, prompts_dir, inv_logger
-        )
-
-        if status_block is None:
-            return
-
-        # Phase rollback: Test failure can roll back to Implement
-        if (
-            status_block.status in ("escalate", "blocked")
-            and task.current_phase == "test"
-            and task.autonomy == "autonomous"
-            and task.retry_count >= 2
-        ):
-            task.phase_history.append(PhaseRecord(
-                phase="test",
-                status="rolled_back",
-                summary=status_block.reason,
-            ))
-            task.current_phase = "implement"
-            task.current_phase_status = "pending"
-            task.retry_count = 0
-            task.last_error = f"Test phase rolled back: {status_block.reason}"
-            previous_error = None
-            store.save_task(task)
-            continue
-
-        # Error / escalate / blocked
-        if status_block.status in ("escalate", "blocked"):
-            current_error = status_block.reason or ""
-            same_error = (previous_error is not None and current_error == previous_error)
-            previous_error = current_error
-
-            task.last_error = current_error
-            task.current_phase_status = "interrupted"
-            store.save_task(task)
-
-            decision = decide_on_error(task.autonomy, task.retry_count, same_error)
-            will_retry = decision == AutonomyDecision.RETRY
-
-            await event_bus.emit("phase.failed", {
-                "event_type": "phase.failed",
-                "thread_id": task.thread_id,
-                "phase": task.current_phase,
-                "error": current_error,
-                "will_retry": will_retry,
-            })
-
-            if will_retry:
-                task.retry_count += 1
-                store.save_task(task)
-                continue
-            else:
-                await event_bus.emit("escalation.needed", {
-                    "event_type": "escalation.needed",
-                    "thread_id": task.thread_id,
-                    "phase": task.current_phase,
-                    "reason": current_error,
-                })
-                return
-
-        # Complete — validate gate
-        project_config = config.projects[task.project]
-        artifacts = status_block.artifacts or []
-        gate = validate_gate(
-            task.current_phase,
-            project_config.path,
-            artifacts=artifacts,
-            branch=task.branch,
-            default_branch=project_config.default_branch,
-            status_complete=True,
-        )
-
-        if gate.passed:
-            previous_error = None
-
-            classified = extract_artifacts_from_status(artifacts, task.current_phase)
-            for a in classified:
-                task.add_artifact(a["type"], a["path"], a["phase"])
-
-            task.advance_phase(summary=status_block.summary, artifacts=artifacts)
-            store.save_task(task)
-
-            await event_bus.emit("phase.completed", {
-                "event_type": "phase.completed",
-                "thread_id": task.thread_id,
-                "phase": task.phase_history[-1].phase,
-                "summary": status_block.summary,
-                "artifacts": artifacts,
-            })
-
-            if task.current_phase_status == "done":
-                await event_bus.emit("task.completed", {
-                    "event_type": "task.completed",
-                    "thread_id": task.thread_id,
-                    "title": task.title,
-                    "summary": status_block.summary,
-                })
-                return
-
-            decision = decide_on_phase_complete(task.autonomy, gate_passed=True)
-            if decision == AutonomyDecision.ADVANCE:
-                continue
-            else:
-                return
-
-        else:
-            task.last_error = gate.reason
-            task.current_phase_status = "interrupted"
-            store.save_task(task)
-
-            decision = decide_on_phase_complete(task.autonomy, gate_passed=False)
-            if decision == AutonomyDecision.RETRY:
-                task.retry_count += 1
-                store.save_task(task)
-                continue
-            else:
-                await event_bus.emit("phase.failed", {
-                    "event_type": "phase.failed",
-                    "thread_id": task.thread_id,
-                    "phase": task.current_phase,
-                    "error": gate.reason,
-                    "will_retry": False,
-                })
-                return
-
-
-async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /task command — create a new task and start Design phase."""
-    if not update.effective_message or not update.effective_message.text:
+def _apply_status_block(task: TaskState, action: str, block: StatusBlock):
+    """Apply status block outcome to task state."""
+    if block.status == "escalate":
+        task.status = "paused"
+        task.last_error = block.reason
         return
 
-    raw_text = update.effective_message.text
-    arg_text = raw_text.split(maxsplit=1)[1] if " " in raw_text else ""
-
-    try:
-        args = parse_task_args(arg_text)
-    except ValueError as e:
-        await update.effective_message.reply_text(
-            f"Usage: /task <title> [--project X] [--autonomy Y]\nError: {e}"
-        )
+    if block.status == "blocked" and action == "brainstorm":
+        task.brainstorm_questions = block.questions
+        task.status = "paused"
         return
 
-    config: BotConfig = context.bot_data["config"]
-    store: TaskStore = context.bot_data["store"]
-    session_mgr: SessionManager = context.bot_data["session_manager"]
-    event_bus: EventBus = context.bot_data["event_bus"]
-
-    # Resolve project
-    project_name = args.project
-    if project_name is None:
-        if len(config.projects) == 1:
-            project_name = next(iter(config.projects))
-        else:
-            projects = ", ".join(config.projects.keys())
-            await update.effective_message.reply_text(
-                f"Multiple projects configured. Specify one with --project: {projects}"
+    if block.status == "complete":
+        if action in ("brainstorm", "brainstorm-spec") and block.artifacts:
+            task.spec_path = block.artifacts[0]
+        elif action == "plan" and block.artifacts:
+            task.plan_path = block.artifacts[0]
+        elif action in ("implement", "fix-review", "fix-tests"):
+            task.implementation_complete = True
+            if action == "fix-review":
+                task.review_result = None
+            elif action == "fix-tests":
+                task.test_result = None
+        elif action == "review":
+            task.review_result = ReviewResult(
+                passed=block.review_passed if block.review_passed is not None else True,
+                feedback_summary=block.feedback or block.summary or "",
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
-            return
-
-    if project_name not in config.projects:
-        await update.effective_message.reply_text(f"Unknown project: {project_name}")
-        return
-
-    # Get thread ID
-    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
-
-    # Check for existing task
-    existing = store.load_task(thread_id)
-    if existing and existing.current_phase_status != "done":
-        await update.effective_message.reply_text(
-            f"This thread already has an active task: {existing.title}"
-        )
-        return
-
-    # Create task
-    autonomy = args.autonomy or config.defaults.autonomy
-    task = TaskState.create(
-        thread_id=thread_id,
-        title=args.title,
-        project=project_name,
-        budget_usd=config.defaults.budget_usd,
-        autonomy=autonomy,
-    )
-    store.save_task(task)
-
-    # Create git branch
-    project_path = str(config.projects[project_name].path)
-    default_branch = config.projects[project_name].default_branch
-    branch_created = await _create_task_branch(project_path, task.branch, default_branch)
-    if not branch_created:
-        await update.effective_message.reply_text(
-            f"Warning: Could not create branch `{task.branch}`. Check git state."
-        )
-
-    await event_bus.emit("task.created", {
-        "event_type": "task.created",
-        "thread_id": thread_id,
-        "title": task.title,
-        "project": project_name,
-        "autonomy": autonomy,
-    })
-
-    await update.effective_message.reply_text(
-        f"Task created: **{task.title}**\n"
-        f"Project: {project_name}\n"
-        f"Branch: `{task.branch}`\n"
-        f"Autonomy: {autonomy}\n"
-        f"Starting Design phase...",
-        parse_mode="Markdown",
-    )
-
-    # Start first phase (fire-and-forget so Telegram handler stays responsive)
-    prompts_dir = Path(__file__).parent.parent.parent.parent / "prompts"
-    asyncio.create_task(_safe_run_task(
-        _run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir),
-        event_bus, thread_id,
-    ))
+            if not task.review_result.passed:
+                task.review_cycle += 1
+                task.implementation_complete = False
+        elif action == "finish":
+            task.status = "completed"
 
 
-def parse_skip_args(text: str) -> str | None:
-    """Parse /skip arguments.
+# -- /auto -------------------------------------------------------------------
 
-    Args:
-        text: Raw argument text after /skip
-
-    Returns:
-        Target phase name, or None to skip just the current phase
-
-    Raises:
-        ValueError: If specified phase doesn't exist
-    """
-    stripped = text.strip()
-    if not stripped:
-        return None
-
-    if stripped not in PHASES:
-        raise ValueError(f"Unknown phase: '{stripped}'. Valid phases: {', '.join(PHASES)}")
-
-    return stripped
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /status — show current task state."""
-    store = context.bot_data.get("store")
-    if not store or not update.effective_message:
-        return
-
-    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
-    task = store.load_task(thread_id)
-
+async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/auto on|off"""
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task = _get_task_for_thread(update.effective_chat.id, thread_id)
     if not task:
-        await update.effective_message.reply_text("No task in this thread.")
+        await update.message.reply_text("No active task in this thread.")
         return
+
+    args = context.args or []
+    if not args or args[0] not in ("on", "off"):
+        await update.message.reply_text("Usage: /auto on|off")
+        return
+
+    task.auto_mode = args[0] == "on"
+    _task_store.save_task(task)
+    await update.message.reply_text(f"Auto mode: {'ON' if task.auto_mode else 'OFF'}")
+
+
+# -- /cancel -----------------------------------------------------------------
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kill running subprocess, pause task."""
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task = _get_task_for_thread(update.effective_chat.id, thread_id)
+    if not task:
+        await update.message.reply_text("No active task in this thread.")
+        return
+
+    if task.subprocess_pid:
+        _session_manager.kill_subprocess()
+        task.subprocess_pid = None
+        task.status = "paused"
+        _task_store.save_task(task)
+        await update.message.reply_text("Task cancelled. Use `/continue` to resume.")
+    else:
+        task.status = "cancelled"
+        _task_store.save_task(task)
+        await update.message.reply_text("Task cancelled.")
+
+
+# -- /status -----------------------------------------------------------------
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show task status."""
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task = _get_task_for_thread(update.effective_chat.id, thread_id)
+    if not task:
+        await update.message.reply_text("No active task in this thread.")
+        return
+
+    def _fmt(result):
+        if result is None:
+            return "---"
+        label = getattr(result, 'summary', None) or getattr(result, 'feedback_summary', '')
+        return f"{'PASS' if result.passed else 'FAIL'} {label}"
 
     lines = [
-        f"**Task:** {task.title}",
-        f"**Project:** {task.project}",
-        f"**Branch:** `{task.branch}`",
-        f"**Phase:** {task.current_phase} ({task.current_phase_status})",
-        f"**Autonomy:** {task.autonomy}",
-        f"**Budget:** ${task.budget_usd:.2f} remaining",
-        f"**Retries:** {task.retry_count}",
+        f"Task: {task.description}",
+        f"Status: {task.status}",
+        f"Next action: {task.next_action}",
+        f"Tokens: {task.tokens_used:,} / {task.token_budget:,}",
+        "",
+        "Artifacts:",
+        f"  Spec: {task.spec_path or '---'}",
+        f"  Plan: {task.plan_path or '---'}",
+        f"  Branch: {task.branch_name or '---'}",
+        f"  Implemented: {'Yes' if task.implementation_complete else 'No'}",
+        f"  Review: {_fmt(task.review_result)}",
+        f"  Tests: {_fmt(task.test_result)}",
+        "",
+        f"Auto mode: {'ON' if task.auto_mode else 'OFF'}",
+        f"Sessions: {len(task.sessions)}",
     ]
-    if task.artifacts:
-        lines.append("**Artifacts:**")
-        for a in task.artifacts:
-            lines.append(f"  - [{a.artifact_type}] {a.path}")
-
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines))
 
 
-async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /continue — approve phase result and advance to next phase."""
-    if not update.effective_message:
-        return
+# -- /budget -----------------------------------------------------------------
 
-    store: TaskStore = context.bot_data["store"]
-    session_mgr: SessionManager = context.bot_data["session_manager"]
-    event_bus: EventBus = context.bot_data["event_bus"]
-    config: BotConfig = context.bot_data["config"]
-
-    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
-    task = store.load_task(thread_id)
-
+async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/budget [amount]"""
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task = _get_task_for_thread(update.effective_chat.id, thread_id)
     if not task:
-        await update.effective_message.reply_text("No task in this thread.")
+        await update.message.reply_text("No active task in this thread.")
         return
 
-    if task.current_phase_status == "in_progress":
-        await update.effective_message.reply_text("Phase still running. Wait for it to complete.")
-        return
+    args = context.args or []
+    if args:
+        try:
+            task.token_budget = int(args[0])
+            _task_store.save_task(task)
+        except ValueError:
+            await update.message.reply_text("Invalid amount.")
+            return
 
-    if task.current_phase_status == "done":
-        await update.effective_message.reply_text("Task already completed.")
-        return
-
-    if task.current_phase_status in ("completed", "pending"):
-        await update.effective_message.reply_text(f"Starting {task.current_phase} phase...")
-        prompts_dir = Path(__file__).parent.parent.parent.parent / "prompts"
-        asyncio.create_task(_safe_run_task(
-            _run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir),
-            event_bus, task.thread_id,
-        ))
-    elif task.current_phase_status == "interrupted":
-        await update.effective_message.reply_text(
-            f"Phase {task.current_phase} was interrupted. Use /retry to re-run or /skip to move on."
-        )
-
-
-async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /skip [phase] — skip current or advance to target phase."""
-    if not update.effective_message or not update.effective_message.text:
-        return
-
-    store: TaskStore = context.bot_data["store"]
-    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
-    task = store.load_task(thread_id)
-
-    if not task:
-        await update.effective_message.reply_text("No task in this thread.")
-        return
-
-    if task.current_phase_status == "in_progress":
-        await update.effective_message.reply_text("Phase in progress. Use /cancel first.")
-        return
-
-    if task.current_phase_status == "done":
-        await update.effective_message.reply_text("Task already completed.")
-        return
-
-    raw_text = update.effective_message.text
-    arg_text = raw_text.split(maxsplit=1)[1] if " " in raw_text else ""
-
-    try:
-        target = parse_skip_args(arg_text)
-    except ValueError as e:
-        await update.effective_message.reply_text(str(e))
-        return
-
-    # Skip current phase (or multiple phases to reach target)
-    skipped_phases = []
-    if target:
-        while task.current_phase != target and task.current_phase_status != "done":
-            skipped_phases.append(task.current_phase)
-            task.phase_history.append(PhaseRecord(
-                phase=task.current_phase, status="skipped",
-            ))
-            nxt = next_phase(task.current_phase)
-            if nxt is None:
-                break
-            task.current_phase = nxt
-            task.current_phase_status = "pending"
-            task.retry_count = 0
-    else:
-        skipped_phases.append(task.current_phase)
-        task.phase_history.append(PhaseRecord(
-            phase=task.current_phase, status="skipped",
-        ))
-        nxt = next_phase(task.current_phase)
-        if nxt is None:
-            task.current_phase_status = "done"
-        else:
-            task.current_phase = nxt
-            task.current_phase_status = "pending"
-            task.retry_count = 0
-
-    store.save_task(task)
-    skipped_str = ", ".join(skipped_phases)
-    await update.effective_message.reply_text(
-        f"Skipped: {skipped_str}. Now at: {task.current_phase} ({task.current_phase_status})"
+    await update.message.reply_text(
+        f"Budget: {task.tokens_used:,} / {task.token_budget:,} tokens"
     )
 
 
-async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /retry — re-run current phase."""
-    if not update.effective_message:
-        return
+# -- /tasks ------------------------------------------------------------------
 
-    store: TaskStore = context.bot_data["store"]
-    session_mgr: SessionManager = context.bot_data["session_manager"]
-    event_bus: EventBus = context.bot_data["event_bus"]
-    config: BotConfig = context.bot_data["config"]
-
-    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
-    task = store.load_task(thread_id)
-
-    if not task:
-        await update.effective_message.reply_text("No task in this thread.")
-        return
-
-    if task.current_phase_status == "in_progress":
-        await update.effective_message.reply_text("Phase in progress. Use /cancel first.")
-        return
-
-    task.retry_count += 1
-    task.current_phase_status = "pending"
-    store.save_task(task)
-
-    await update.effective_message.reply_text(
-        f"Retrying {task.current_phase} phase (attempt {task.retry_count + 1})..."
-    )
-    prompts_dir = Path(__file__).parent.parent.parent.parent / "prompts"
-    asyncio.create_task(_safe_run_task(
-        _run_task_loop(task, store, session_mgr, event_bus, config, prompts_dir),
-        event_bus, task.thread_id,
-    ))
-
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /cancel — kill running subprocess."""
-    session_mgr = context.bot_data.get("session_manager")
-    if session_mgr:
-        session_mgr.request_cancel()
-        killed = session_mgr.kill_subprocess()
-        if killed:
-            await update.effective_message.reply_text(
-                "Cancelled. Reply /retry to re-run this phase or /skip to move on."
-            )
-        else:
-            await update.effective_message.reply_text("No phase currently running.")
-    else:
-        await update.effective_message.reply_text("Session manager not initialized.")
-
-
-async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /tasks — list all active tasks."""
-    store = context.bot_data.get("store")
-    if not store:
-        await update.effective_message.reply_text("Store not initialized.")
-        return
-
-    all_tasks = store.list_tasks()
-    active = [t for t in all_tasks if t.current_phase_status != "done"]
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all active tasks."""
+    all_tasks = _task_store.list_tasks()
+    active = [t for t in all_tasks if t.status in ("active", "paused")]
 
     if not active:
-        await update.effective_message.reply_text("No active tasks.")
+        await update.message.reply_text("No active tasks.")
         return
 
-    lines = ["**Active Tasks:**"]
-    for t in sorted(active, key=lambda x: x.updated_at, reverse=True):
-        lines.append(
-            f"- [{t.title}] {t.project} — {t.current_phase} ({t.current_phase_status})"
-        )
-
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+    lines = []
+    for t in active:
+        lines.append(f"[{t.task_id}] {t.description} -- {t.next_action} ({t.status})")
+    await update.message.reply_text("\n".join(lines))
 
 
-async def budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /budget [amount] — show or add budget."""
-    if not update.effective_message:
-        return
+# -- /answer -----------------------------------------------------------------
 
-    store: TaskStore = context.bot_data["store"]
-    thread_id = update.effective_message.message_thread_id or update.effective_chat.id
-    task = store.load_task(thread_id)
-
+async def cmd_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/answer <text> -- provide answers to brainstorm questions."""
+    thread_id = update.message.message_thread_id or update.message.message_id
+    task = _get_task_for_thread(update.effective_chat.id, thread_id)
     if not task:
-        await update.effective_message.reply_text("No task in this thread.")
+        await update.message.reply_text("No active task in this thread.")
         return
 
-    raw_text = update.effective_message.text or ""
-    arg_text = raw_text.split(maxsplit=1)[1].strip() if " " in raw_text else ""
-
-    if not arg_text:
-        await update.effective_message.reply_text(
-            f"Budget: ${task.budget_usd:.2f} remaining\n"
-            f"Phase: {task.current_phase} (budget cap: ${task.calculate_phase_budget():.2f})"
-        )
+    if not task.brainstorm_questions:
+        await update.message.reply_text("No pending brainstorm questions.")
         return
 
-    try:
-        amount = float(arg_text)
-    except ValueError:
-        await update.effective_message.reply_text("Usage: /budget [amount]")
+    user_answers = " ".join(context.args or [])
+    if not user_answers:
+        await update.message.reply_text("Usage: /answer <your answers>")
         return
 
-    task.add_budget(amount)
-    store.save_task(task)
-    await update.effective_message.reply_text(
-        f"Added ${amount:.2f}. New balance: ${task.budget_usd:.2f}"
-    )
+    fenced_answers = _fence_user_message(user_answers)
+
+    task.brainstorm_questions = []
+    task.status = "active"
+    _task_store.save_task(task)
+
+    await _run_action(update, task, "brainstorm-spec", user_input=fenced_answers)
+
+
+# -- /ping -------------------------------------------------------------------
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")

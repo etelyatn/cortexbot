@@ -107,6 +107,9 @@ class TaskState:
     # Auto mode
     auto_mode: bool = False
 
+    # Brainstorm
+    brainstorm_questions: list[str] = field(default_factory=list)
+
     # Lifecycle
     status: str = "active"
     last_error: Optional[str] = None
@@ -170,6 +173,7 @@ class TaskState:
             "telegram_thread_id": self.telegram_thread_id,
             "telegram_status_message_id": self.telegram_status_message_id,
             "auto_mode": self.auto_mode,
+            "brainstorm_questions": self.brainstorm_questions,
             "status": self.status,
             "last_error": self.last_error,
             "created_at": self.created_at,
@@ -203,6 +207,7 @@ class TaskState:
             telegram_thread_id=d.get("telegram_thread_id"),
             telegram_status_message_id=d.get("telegram_status_message_id"),
             auto_mode=d.get("auto_mode", False),
+            brainstorm_questions=d.get("brainstorm_questions", []),
             status=d.get("status", "active"),
             last_error=d.get("last_error"),
             created_at=d.get("created_at", ""),
