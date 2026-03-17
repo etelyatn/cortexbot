@@ -544,3 +544,143 @@ async def cmd_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
+
+
+# ── /chat ─────────────────────────────────────────────────
+
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chat <message> — start or continue a freeform chat session."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /chat <message>")
+        return
+
+    project = _resolve_project(update.effective_chat.id)
+    if not project:
+        await update.message.reply_text("No project for this group.")
+        return
+
+    name, proj = project
+    message = " ".join(args)
+    fenced_message = _fence_user_message(message)
+
+    thread_id = update.message.message_thread_id or update.message.message_id
+
+    # Find or create chat session
+    from cortexbot.chat.store import ChatSessionStore
+    chat_store = ChatSessionStore(base_dir=Path.home() / ".cortexbot")
+
+    existing = chat_store.find_by_thread(update.effective_chat.id, thread_id)
+    is_resume = existing is not None
+
+    if existing:
+        session = existing
+    else:
+        from cortexbot.chat.session import ChatSession
+        session = ChatSession(
+            session_id=str(_uuid.uuid4()),
+            project=name,
+            telegram_chat_id=update.effective_chat.id,
+            telegram_thread_id=thread_id,
+        )
+        chat_store.save(session)
+        await _event_bus.emit("chat.started", {"session_id": session.session_id, "project": name})
+
+    # Acquire session mutex
+    try:
+        await _session_manager.try_acquire(subprocess_type="chat")
+    except RuntimeError as e:
+        await update.message.reply_text(str(e))
+        return
+
+    try:
+        invocation = build_invocation(
+            prompt=fenced_message,
+            session_id=session.session_id,
+            action="chat",
+            mcp_config=proj.mcp_config,
+            resume=is_resume,
+        )
+        invocation.cwd = proj.path
+
+        process = await run_claude(invocation)
+        session.subprocess_pid = process.pid
+        _session_manager.current_pid = process.pid
+        chat_store.save(session)
+
+        # Collect response
+        response_text = ""
+        total_tokens = 0
+        async for raw_line in process.stdout:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            event = parse_stream_line(line)
+            if event is None:
+                continue
+            if event.type == "assistant" and event.text:
+                response_text += event.text
+            if event.type == "result" and event.input_tokens > 0:
+                total_tokens = event.input_tokens + event.output_tokens
+
+        await process.wait()
+
+        session.message_count += 1
+        session.tokens_used += total_tokens
+        session.subprocess_pid = None
+        from datetime import datetime, timezone
+        session.last_activity = datetime.now(timezone.utc).isoformat()
+        chat_store.save(session)
+
+        # Send response (truncate if too long for Telegram)
+        if response_text:
+            if len(response_text) > 4000:
+                response_text = response_text[:4000] + "\n...(truncated)"
+            await update.message.reply_text(response_text)
+        else:
+            await update.message.reply_text("(no response)")
+
+    finally:
+        _session_manager.release()
+
+
+# ── /chat_end ─────────────────────────────────────────────
+
+async def cmd_chat_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """End the current chat session."""
+    thread_id = update.message.message_thread_id or update.message.message_id
+
+    from cortexbot.chat.store import ChatSessionStore
+    chat_store = ChatSessionStore(base_dir=Path.home() / ".cortexbot")
+    session = chat_store.find_by_thread(update.effective_chat.id, thread_id)
+
+    if not session:
+        await update.message.reply_text("No active chat session in this thread.")
+        return
+
+    await _event_bus.emit("chat.ended", {
+        "session_id": session.session_id,
+        "message_count": session.message_count,
+    })
+    chat_store.delete(session.session_id)
+    await update.message.reply_text(
+        f"Chat ended. {session.message_count} messages, {session.tokens_used:,} tokens."
+    )
+
+
+# ── /chat_history ─────────────────────────────────────────
+
+async def cmd_chat_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List active chat sessions."""
+    from cortexbot.chat.store import ChatSessionStore
+    chat_store = ChatSessionStore(base_dir=Path.home() / ".cortexbot")
+    sessions = chat_store.list_sessions()
+
+    if not sessions:
+        await update.message.reply_text("No active chat sessions.")
+        return
+
+    lines = []
+    for s in sessions:
+        lines.append(f"• [{s.session_id[:8]}] {s.project} — {s.message_count} msgs, {s.tokens_used:,} tokens")
+    await update.message.reply_text("\n".join(lines))
