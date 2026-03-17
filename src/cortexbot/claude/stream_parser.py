@@ -54,6 +54,18 @@ class StreamEvent:
         """Whether this event increments session_event_count."""
         return self.type in _ROTATION_COUNTED_TYPES
 
+    @property
+    def input_tokens(self) -> int:
+        if self.usage:
+            return self.usage.get("input_tokens", 0)
+        return 0
+
+    @property
+    def output_tokens(self) -> int:
+        if self.usage:
+            return self.usage.get("output_tokens", 0)
+        return 0
+
 
 @dataclass
 class StatusBlock:
@@ -63,6 +75,9 @@ class StatusBlock:
     summary: str | None = None
     reason: str | None = None
     artifacts: list[str] = field(default_factory=list)
+    review_passed: bool | None = None
+    feedback: str | None = None
+    questions: list[str] = field(default_factory=list)
 
     @classmethod
     def from_text(cls, text: str) -> StatusBlock | None:
@@ -94,6 +109,9 @@ class StatusBlock:
                                 summary=obj.get("summary"),
                                 reason=obj.get("reason"),
                                 artifacts=obj.get("artifacts", []),
+                                review_passed=obj.get("review_passed"),
+                                feedback=obj.get("feedback"),
+                                questions=obj.get("questions", []),
                             )
             except (json.JSONDecodeError, KeyError):
                 continue

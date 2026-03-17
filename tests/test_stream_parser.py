@@ -135,3 +135,34 @@ class TestStatusBlock:
         block = StatusBlock.from_text(text)
         assert block is not None
         assert block.status == "complete"
+
+    def test_status_block_review_passed(self) -> None:
+        text = '{"status": "complete", "review_passed": true, "summary": "All good", "artifacts": []}'
+        block = StatusBlock.from_text(text)
+        assert block is not None
+        assert block.status == "complete"
+        assert block.review_passed is True
+        assert block.summary == "All good"
+
+    def test_status_block_review_failed_with_feedback(self) -> None:
+        text = '{"status": "complete", "review_passed": false, "summary": "3 issues", "feedback": "1. Fix X 2. Fix Y", "artifacts": []}'
+        block = StatusBlock.from_text(text)
+        assert block is not None
+        assert block.review_passed is False
+        assert block.feedback == "1. Fix X 2. Fix Y"
+
+    def test_status_block_no_review_field(self) -> None:
+        """Standard completion without review_passed field."""
+        text = '{"status": "complete", "summary": "Done", "artifacts": ["spec.md"]}'
+        block = StatusBlock.from_text(text)
+        assert block is not None
+        assert block.review_passed is None
+        assert block.artifacts == ["spec.md"]
+
+    def test_status_block_questions(self) -> None:
+        text = '{"status": "blocked", "reason": "awaiting_answers", "questions": ["What framework?", "Which DB?"]}'
+        block = StatusBlock.from_text(text)
+        assert block is not None
+        assert block.status == "blocked"
+        assert len(block.questions) == 2
+        assert "What framework?" in block.questions
