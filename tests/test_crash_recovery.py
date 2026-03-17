@@ -10,24 +10,24 @@ from cortexbot.main import recover_interrupted_tasks
 
 
 @pytest.fixture
-def store_with_tasks(tmp_dir: Path) -> TaskStore:
+def store_with_tasks(tmp_path: Path) -> TaskStore:
     """Store with a mix of task states."""
-    store = TaskStore(base_dir=tmp_dir)
+    store = TaskStore(base_dir=tmp_path)
 
     # Normal completed task
-    t1 = TaskState.create(thread_id=1, title="Done", project="p", budget_usd=5.0)
-    t1.current_phase_status = "completed"
+    t1 = TaskState(task_id="1", project="p", description="Done")
+    t1.status = "completed"
     store.save_task(t1)
 
-    # Interrupted task (PID gone)
-    t2 = TaskState.create(thread_id=2, title="Interrupted", project="p", budget_usd=5.0)
-    t2.current_phase_status = "in_progress"
+    # Active task with dead PID
+    t2 = TaskState(task_id="2", project="p", description="Interrupted")
+    t2.status = "active"
     t2.subprocess_pid = 999999  # non-existent PID
     store.save_task(t2)
 
-    # Pending task (normal)
-    t3 = TaskState.create(thread_id=3, title="Pending", project="p", budget_usd=5.0)
-    t3.current_phase_status = "pending"
+    # Active task without PID (normal)
+    t3 = TaskState(task_id="3", project="p", description="Pending")
+    t3.status = "active"
     store.save_task(t3)
 
     return store
@@ -38,22 +38,25 @@ class TestCrashRecovery:
     """Test interrupted task detection on startup."""
 
     async def test_detects_interrupted_tasks(self, store_with_tasks: TaskStore) -> None:
-        """Finds tasks with in_progress status and dead PIDs."""
+        """Finds tasks with active status and dead PIDs."""
         interrupted = await recover_interrupted_tasks(store_with_tasks)
         assert len(interrupted) == 1
-        assert interrupted[0].thread_id == 2
+        assert interrupted[0].task_id == "2"
 
-    async def test_marks_interrupted(self, store_with_tasks: TaskStore) -> None:
-        """Interrupted tasks are marked as interrupted on disk."""
+    async def test_clears_dead_pid(self, store_with_tasks: TaskStore) -> None:
+        """Interrupted tasks have PID cleared and last_error set."""
         await recover_interrupted_tasks(store_with_tasks)
-        task = store_with_tasks.load_task(2)
-        assert task.current_phase_status == "interrupted"
+        task = store_with_tasks.load_task("2")
         assert task.subprocess_pid is None
+        assert task.session_id is None
+        assert task.last_error is not None
+        # V2: task stays active (will resume from last artifact)
+        assert task.status == "active"
 
-    async def test_no_interrupted_tasks(self, tmp_dir: Path) -> None:
+    async def test_no_interrupted_tasks(self, tmp_path: Path) -> None:
         """Returns empty list when no tasks are interrupted."""
-        store = TaskStore(base_dir=tmp_dir)
-        t = TaskState.create(thread_id=1, title="OK", project="p", budget_usd=5.0)
+        store = TaskStore(base_dir=tmp_path)
+        t = TaskState(task_id="1", project="p", description="OK")
         store.save_task(t)
         interrupted = await recover_interrupted_tasks(store)
         assert interrupted == []
