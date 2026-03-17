@@ -147,6 +147,12 @@ def main() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
+    if len(sys.argv) > 1 and sys.argv[1] == "init":
+        from cortexbot.cli.init import run_init
+        bot_dir = Path.home() / ".cortexbot"
+        run_init(bot_dir)
+        return
+
     config_path = None
     if len(sys.argv) > 1:
         config_path = Path(sys.argv[1])
