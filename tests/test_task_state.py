@@ -1,172 +1,143 @@
-"""Tests for TaskState data model."""
-
-from datetime import datetime, timezone
-
 import pytest
-
 from cortexbot.orchestrator.task_manager import (
-    Artifact,
-    PhaseRecord,
-    TaskState,
-    PHASES,
-    next_phase,
-    slugify,
+    TaskState, ReviewResult, TestResult, SessionRecord,
 )
 
 
-class TestSlugify:
-    """Test title to branch slug conversion."""
-
-    def test_simple_title(self) -> None:
-        assert slugify("Add data tables") == "add-data-tables"
-
-    def test_special_characters(self) -> None:
-        assert slugify("Fix bug #123!") == "fix-bug-123"
-
-    def test_long_title_truncated(self) -> None:
-        long_title = "a" * 100
-        result = slugify(long_title)
-        assert len(result) <= 50
-
-    def test_leading_trailing_hyphens(self) -> None:
-        assert slugify("--hello--") == "hello"
+def test_next_action_brainstorm():
+    """No spec -> brainstorm."""
+    task = TaskState(task_id="123", project="sandbox", description="Add inventory")
+    assert task.next_action == "brainstorm"
 
 
-class TestPhases:
-    """Test phase ordering."""
-
-    def test_phase_order(self) -> None:
-        assert PHASES == ["design", "plan", "implement", "test", "merge"]
-
-    def test_next_phase(self) -> None:
-        assert next_phase("design") == "plan"
-        assert next_phase("plan") == "implement"
-        assert next_phase("implement") == "test"
-        assert next_phase("test") == "merge"
-
-    def test_next_phase_after_merge_is_none(self) -> None:
-        assert next_phase("merge") is None
+def test_next_action_plan():
+    """Has spec, no plan -> plan."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.spec_path = "docs/superpowers/specs/test.md"
+    assert task.next_action == "plan"
 
 
-class TestTaskState:
-    """Test TaskState creation and serialization."""
-
-    def test_create_task(self) -> None:
-        """Create a new task with defaults."""
-        task = TaskState.create(
-            thread_id=12345,
-            title="Add data tables",
-            project="sandbox",
-            budget_usd=10.0,
-        )
-        assert task.thread_id == 12345
-        assert task.title == "Add data tables"
-        assert task.project == "sandbox"
-        assert task.branch == "task/12345-add-data-tables"
-        assert task.current_phase == "design"
-        assert task.current_phase_status == "pending"
-        assert task.autonomy == "supervised"
-        assert task.budget_usd == 10.0
-        assert task.retry_count == 0
-        assert task.phase_history == []
-        assert task.artifacts == []
-
-    def test_to_dict_and_from_dict(self) -> None:
-        """Round-trip serialization."""
-        task = TaskState.create(
-            thread_id=12345,
-            title="Test task",
-            project="sandbox",
-            budget_usd=5.0,
-        )
-        data = task.to_dict()
-        restored = TaskState.from_dict(data)
-        assert restored.thread_id == task.thread_id
-        assert restored.title == task.title
-        assert restored.branch == task.branch
-        assert restored.current_phase == task.current_phase
-
-    def test_advance_phase(self) -> None:
-        """Advancing phase moves to next and resets retry count."""
-        task = TaskState.create(
-            thread_id=1, title="Test", project="p", budget_usd=10.0
-        )
-        task.current_phase_status = "completed"
-        task.retry_count = 2
-        task.session_id = "some-session-id"
-        task.session_event_count = 5
-
-        task.advance_phase(summary="Design done", artifacts=["/docs/design.md"])
-
-        assert task.current_phase == "plan"
-        assert task.current_phase_status == "pending"
-        assert task.retry_count == 0
-        assert task.session_id is None
-        assert task.session_event_count == 0
-        assert len(task.phase_history) == 1
-        assert task.phase_history[0].phase == "design"
-        assert task.phase_history[0].summary == "Design done"
-
-    def test_advance_past_merge_completes(self) -> None:
-        """Advancing past merge marks task as complete."""
-        task = TaskState.create(
-            thread_id=1, title="Test", project="p", budget_usd=10.0
-        )
-        task.current_phase = "merge"
-        task.current_phase_status = "completed"
-
-        task.advance_phase(summary="PR created")
-
-        assert task.current_phase == "merge"
-        assert task.current_phase_status == "done"
-
-    def test_artifact_tracking(self) -> None:
-        """Artifacts can be added and queried."""
-        task = TaskState.create(
-            thread_id=1, title="Test", project="p", budget_usd=10.0
-        )
-        task.add_artifact("design_doc", "/docs/design.md", "design")
-        assert len(task.artifacts) == 1
-        assert task.artifacts[0].artifact_type == "design_doc"
-        assert task.artifacts[0].path == "/docs/design.md"
+def test_next_action_implement():
+    """Has spec + plan, not implemented -> implement."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.spec_path = "docs/specs/test.md"
+    task.plan_path = "docs/plans/test.md"
+    assert task.next_action == "implement"
 
 
-class TestBudget:
-    """Test budget tracking."""
+def test_next_action_review():
+    """Implementation complete, no review -> review."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.spec_path = "s"
+    task.plan_path = "p"
+    task.implementation_complete = True
+    assert task.next_action == "review"
 
-    def test_deduct_cost(self) -> None:
-        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=10.0)
-        task.deduct_cost(3.5)
-        assert task.budget_usd == 6.5
 
-    def test_deduct_does_not_go_negative(self) -> None:
-        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=2.0)
-        task.deduct_cost(5.0)
-        assert task.budget_usd == 0.0
+def test_next_action_test():
+    """Review passed, no test -> test."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.spec_path = "s"
+    task.plan_path = "p"
+    task.implementation_complete = True
+    task.review_result = ReviewResult(passed=True, feedback_summary="LGTM")
+    assert task.next_action == "test"
 
-    def test_add_budget(self) -> None:
-        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=5.0)
-        task.add_budget(3.0)
-        assert task.budget_usd == 8.0
 
-    def test_phase_budget_design_with_10(self) -> None:
-        """Design phase with $10: 50% of remaining ($10) = $5, capped for this phase."""
-        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=10.0)
-        # design = index 0, 5 remaining phases
-        # Formula: (remaining * 0.5) / remaining_phases, min $1
-        # = ($10 * 0.5) / 5 phases = $1.00
-        budget = task.calculate_phase_budget()
-        assert budget == 1.0
+def test_next_action_finish():
+    """Review passed + tests passed -> finish."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.spec_path = "s"
+    task.plan_path = "p"
+    task.implementation_complete = True
+    task.review_result = ReviewResult(passed=True, feedback_summary="LGTM")
+    task.test_result = TestResult(passed=True, summary="47 passed")
+    assert task.next_action == "finish"
 
-    def test_phase_budget_last_phase(self) -> None:
-        """Merge (last phase) gets all remaining budget."""
-        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=3.0)
-        task.current_phase = "merge"
-        budget = task.calculate_phase_budget()
-        assert budget == 3.0
 
-    def test_phase_budget_minimum_is_one(self) -> None:
-        """Phase budget never goes below $1."""
-        task = TaskState.create(thread_id=1, title="T", project="p", budget_usd=0.50)
-        budget = task.calculate_phase_budget()
-        assert budget == 1.0
+def test_next_action_fix_review():
+    """Review failed, under max cycles -> fix-review."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.spec_path = "s"
+    task.plan_path = "p"
+    task.implementation_complete = True
+    task.review_result = ReviewResult(passed=False, feedback_summary="3 issues")
+    task.review_cycle = 1
+    assert task.next_action == "fix-review"
+
+
+def test_next_action_fix_tests():
+    """Tests failed, under max cycles -> fix-tests."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.spec_path = "s"
+    task.plan_path = "p"
+    task.implementation_complete = True
+    task.review_result = ReviewResult(passed=True, feedback_summary="ok")
+    task.test_result = TestResult(passed=False, summary="2 failed", failed_tests=["test_a"])
+    task.test_cycle = 1
+    assert task.next_action == "fix-tests"
+
+
+def test_next_action_escalate_review():
+    """Review failed at max cycles -> escalate."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.review_result = ReviewResult(passed=False, feedback_summary="issues")
+    task.review_cycle = 3
+    task.max_cycles = 3
+    assert task.next_action == "escalate"
+
+
+def test_next_action_escalate_tests():
+    """Tests failed at max cycles -> escalate."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.test_result = TestResult(passed=False, summary="fail", failed_tests=["x"])
+    task.test_cycle = 3
+    task.max_cycles = 3
+    assert task.next_action == "escalate"
+
+
+def test_next_action_budget_exceeded():
+    """Over token budget -> budget-exceeded."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.token_budget = 100000
+    task.tokens_used = 100001
+    assert task.next_action == "budget-exceeded"
+
+
+def test_next_action_paused():
+    """Paused status -> paused."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.status = "paused"
+    assert task.next_action == "paused"
+
+
+def test_next_action_completed_returns_paused():
+    """Completed status also returns paused (non-active)."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.status = "completed"
+    assert task.next_action == "paused"
+
+
+def test_next_action_cancelled_returns_paused():
+    """Cancelled status also returns paused (non-active)."""
+    task = TaskState(task_id="123", project="sandbox", description="test")
+    task.status = "cancelled"
+    assert task.next_action == "paused"
+
+
+def test_serialization_round_trip():
+    """TaskState serializes to dict and back."""
+    task = TaskState(task_id="42", project="sandbox", description="Build it")
+    task.spec_path = "spec.md"
+    task.review_result = ReviewResult(passed=False, feedback_summary="fix x")
+    task.sessions.append(SessionRecord(session_id="abc", action="brainstorm", started_at="2026-01-01"))
+
+    d = task.to_dict()
+    restored = TaskState.from_dict(d)
+
+    assert restored.task_id == "42"
+    assert restored.spec_path == "spec.md"
+    assert restored.review_result.passed is False
+    assert restored.review_result.feedback_summary == "fix x"
+    assert len(restored.sessions) == 1
+    assert restored.sessions[0].session_id == "abc"
