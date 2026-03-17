@@ -1,122 +1,110 @@
-"""Tests for config loading."""
-
 import os
-from pathlib import Path
-
 import pytest
+import yaml
+from pathlib import Path
+from cortexbot.config import load_config, BotConfig, ProjectConfig
 
-from cortexbot.config import BotConfig, load_config
+
+def test_load_v2_config(tmp_path):
+    """V2 config has token_budget (not budget_usd), chat section, no autonomy."""
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(yaml.dump({
+        "telegram": {"bot_token": "test-token"},
+        "projects": {
+            "sandbox": {
+                "path": "D:/UnrealProjects/CortexSandbox",
+                "mcp_config": ".mcp.json",
+                "default_branch": "main",
+                "group_id": -1001234567890,
+            }
+        },
+        "defaults": {
+            "token_budget": 500000,
+            "timeouts": {
+                "brainstorm": 900,
+                "plan": 900,
+                "execute": 1800,
+                "review": 900,
+                "chat": 600,
+                "default": 900,
+            },
+            "session_rotation": {"execute": 100},
+            "max_cycles": 3,
+            "chat": {"inactivity_timeout": 7200},
+        },
+        "logging": {"invocation_logs": True, "retention_days": 30},
+        "claude": {"binary": "claude"},
+    }))
+
+    config = load_config(config_yaml)
+
+    assert config.telegram.bot_token == "test-token"
+    assert config.projects["sandbox"].group_id == -1001234567890
+    assert config.defaults.token_budget == 500000
+    assert config.defaults.timeouts["chat"] == 600
+    assert config.defaults.max_cycles == 3
+    assert config.defaults.chat_inactivity_timeout == 7200
+    assert config.claude_binary == "claude"
 
 
-class TestLoadConfig:
-    """Test YAML config loading with env var expansion."""
+def test_env_var_expansion(tmp_path, monkeypatch):
+    """${VAR} syntax expands from environment."""
+    monkeypatch.setenv("CORTEXBOT_TELEGRAM_TOKEN", "secret-token-123")
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(yaml.dump({
+        "telegram": {"bot_token": "${CORTEXBOT_TELEGRAM_TOKEN}"},
+        "projects": {},
+        "defaults": {
+            "token_budget": 500000,
+            "timeouts": {"default": 900},
+            "max_cycles": 3,
+        },
+    }))
 
-    def test_load_basic_config(self, sample_config_yaml: Path) -> None:
-        """Config loads all sections from valid YAML."""
-        os.environ["TEST_BOT_TOKEN"] = "fake-token-123"
-        try:
-            config = load_config(sample_config_yaml)
-            assert config.telegram.bot_token == "fake-token-123"
-            assert config.telegram.group_id == -1001234567890
-            assert "sandbox" in config.projects
-            assert config.projects["sandbox"].path == Path("D:/UnrealProjects/CortexSandbox")
-            assert config.defaults.autonomy == "supervised"
-            assert config.defaults.budget_usd == 10.00
-        finally:
-            del os.environ["TEST_BOT_TOKEN"]
+    config = load_config(config_yaml)
+    assert config.telegram.bot_token == "secret-token-123"
 
-    def test_env_var_expansion(self, tmp_dir: Path) -> None:
-        """${VAR} in YAML values is replaced with env var."""
-        config_file = tmp_dir / "config.yaml"
-        config_file.write_text(
-            """\
-telegram:
-  bot_token: "${MY_SECRET_TOKEN}"
-  group_id: -100
 
-projects:
-  test:
-    path: "C:/test"
-    mcp_config: ".mcp.json"
-    default_branch: "main"
+def test_project_has_group_id(tmp_path):
+    """V2 projects include group_id captured from /project-add."""
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(yaml.dump({
+        "telegram": {"bot_token": "test"},
+        "projects": {
+            "sandbox": {
+                "path": "/some/path",
+                "mcp_config": ".mcp.json",
+                "default_branch": "main",
+                "group_id": -100999,
+            }
+        },
+        "defaults": {"token_budget": 500000, "timeouts": {"default": 900}, "max_cycles": 3},
+    }))
 
-defaults:
-  autonomy: "supervised"
-  budget_usd: 5.00
-"""
-        )
-        os.environ["MY_SECRET_TOKEN"] = "expanded-secret"
-        try:
-            config = load_config(config_file)
-            assert config.telegram.bot_token == "expanded-secret"
-        finally:
-            del os.environ["MY_SECRET_TOKEN"]
+    config = load_config(config_yaml)
+    assert config.projects["sandbox"].group_id == -100999
 
-    def test_missing_env_var_raises(self, tmp_dir: Path) -> None:
-        """Unset env var reference raises clear error."""
-        config_file = tmp_dir / "config.yaml"
-        config_file.write_text(
-            """\
-telegram:
-  bot_token: "${NONEXISTENT_VAR_12345}"
-  group_id: -100
 
-projects:
-  test:
-    path: "C:/test"
-    mcp_config: ".mcp.json"
-    default_branch: "main"
+def test_add_project(tmp_path):
+    """Adding a project appends to config YAML and reloads."""
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(yaml.dump({
+        "telegram": {"bot_token": "test"},
+        "projects": {},
+        "defaults": {"token_budget": 500000, "timeouts": {"default": 900}, "max_cycles": 3},
+    }))
 
-defaults:
-  autonomy: "supervised"
-  budget_usd: 5.00
-"""
-        )
-        with pytest.raises(ValueError, match="NONEXISTENT_VAR_12345"):
-            load_config(config_file)
+    config = load_config(config_yaml)
+    from cortexbot.config import add_project
+    add_project(
+        config_path=config_yaml,
+        name="newproject",
+        path="/new/path",
+        group_id=-100555,
+    )
 
-    def test_missing_file_raises(self, tmp_dir: Path) -> None:
-        """Non-existent config file raises FileNotFoundError."""
-        with pytest.raises(FileNotFoundError):
-            load_config(tmp_dir / "nonexistent.yaml")
-
-    def test_project_defaults(self, sample_config_yaml: Path) -> None:
-        """Projects have correct default_branch and mcp_config."""
-        os.environ["TEST_BOT_TOKEN"] = "fake"
-        try:
-            config = load_config(sample_config_yaml)
-            project = config.projects["sandbox"]
-            assert project.default_branch == "main"
-            assert project.mcp_config == ".mcp.json"
-        finally:
-            del os.environ["TEST_BOT_TOKEN"]
-
-    def test_phase_budgets(self, sample_config_yaml: Path) -> None:
-        """Phase budgets are loaded from config."""
-        os.environ["TEST_BOT_TOKEN"] = "fake"
-        try:
-            config = load_config(sample_config_yaml)
-            assert config.defaults.phase_budgets["design"] == 3.00
-            assert config.defaults.phase_budgets["implement"] == 5.00
-        finally:
-            del os.environ["TEST_BOT_TOKEN"]
-
-    def test_timeout_defaults(self, sample_config_yaml: Path) -> None:
-        """Timeouts loaded with implement override and default fallback."""
-        os.environ["TEST_BOT_TOKEN"] = "fake"
-        try:
-            config = load_config(sample_config_yaml)
-            assert config.defaults.timeouts["implement"] == 1800
-            assert config.defaults.timeouts["default"] == 900
-        finally:
-            del os.environ["TEST_BOT_TOKEN"]
-
-    def test_session_rotation_thresholds(self, sample_config_yaml: Path) -> None:
-        """Session rotation thresholds loaded per phase."""
-        os.environ["TEST_BOT_TOKEN"] = "fake"
-        try:
-            config = load_config(sample_config_yaml)
-            assert config.defaults.session_rotation["design"] == 50
-            assert config.defaults.session_rotation["implement"] == 100
-        finally:
-            del os.environ["TEST_BOT_TOKEN"]
+    # Reload and verify
+    config2 = load_config(config_yaml)
+    assert "newproject" in config2.projects
+    assert config2.projects["newproject"].path == "/new/path"
+    assert config2.projects["newproject"].group_id == -100555

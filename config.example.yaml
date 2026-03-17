@@ -1,30 +1,27 @@
+# ~/.cortexbot/config.yaml
+# CortexBot V2 configuration
+
 telegram:
   bot_token: "${CORTEXBOT_TELEGRAM_TOKEN}"
-  group_id: -1001234567890  # Your Telegram group ID
 
-projects:
-  sandbox:
-    path: "D:/UnrealProjects/CortexSandbox"
-    mcp_config: ".mcp.json"
-    default_branch: "main"
+# Projects are registered via /project-add from Telegram.
+# You can also add them manually here.
+projects: {}
 
 defaults:
-  autonomy: "supervised"
-  budget_usd: 10.00
-  phase_budgets:
-    design: 3.00
-    plan: 2.00
-    implement: 5.00
-    test: 3.00
-    merge: 1.00
-  session_rotation:
-    design: 50
-    plan: 50
-    implement: 100
-    test: 40
+  token_budget: 500000
   timeouts:
-    implement: 1800
+    brainstorm: 900       # 15 minutes
+    plan: 900
+    execute: 1800         # 30 minutes
+    review: 900
+    chat: 600             # 10 minutes per message
     default: 900
+  session_rotation:
+    execute: 100          # event count threshold
+  max_cycles: 3           # review/test retry limit
+  chat:
+    inactivity_timeout: 7200  # 2 hours
 
 logging:
   invocation_logs: true
