@@ -1,4 +1,4 @@
-"""CortexBot entry point."""
+"""CortexBot V2 entry point."""
 
 from __future__ import annotations
 
@@ -12,11 +12,14 @@ import psutil
 from dotenv import load_dotenv
 
 from cortexbot.config import load_config
-from cortexbot.events.bus import EventBus
-from cortexbot.bot.telegram import create_application
 from cortexbot.memory.store import TaskStore
+from cortexbot.chat.store import ChatSessionStore
 from cortexbot.orchestrator.task_manager import TaskState
 from cortexbot.orchestrator.session_manager import SessionManager
+from cortexbot.events.bus import EventBus
+from cortexbot.events.telegram_handler import TelegramEventHandler
+from cortexbot.bot.telegram import create_application
+from cortexbot.bot.commands import init_commands
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +27,7 @@ DEFAULT_CONFIG_PATH = Path.home() / ".cortexbot" / "config.yaml"
 
 
 async def recover_interrupted_tasks(store: TaskStore) -> list[TaskState]:
-    """Detect and clean up tasks with dead subprocess PIDs.
-
-    Scans all active tasks for dead subprocess PIDs. Clears PID and session
-    so the task can be resumed from its last artifact.
-
-    Returns:
-        List of tasks that had dead PIDs cleared
-    """
+    """Detect and clean up tasks with dead subprocess PIDs."""
     interrupted = []
 
     for task in store.list_tasks():
@@ -66,40 +62,45 @@ async def run(config_path: Path | None = None) -> None:
     """Start CortexBot."""
     import signal
 
-    # Load .env from bot directory
+    # Load .env
     bot_dir = Path.home() / ".cortexbot"
     env_path = bot_dir / ".env"
     if env_path.exists():
         load_dotenv(env_path)
 
     path = config_path or DEFAULT_CONFIG_PATH
+    if not path.exists():
+        print("Config not found. Run `cortexbot init` first.")
+        sys.exit(1)
+
     logger.info("Loading config from %s", path)
     config = load_config(path)
 
     # Initialize components
     store = TaskStore(base_dir=bot_dir)
+    chat_store = ChatSessionStore(base_dir=bot_dir)
     event_bus = EventBus()
     session_mgr = SessionManager()
 
+    # Wire commands
+    init_commands(config, store, session_mgr, event_bus)
+
     # Crash recovery
     interrupted = await recover_interrupted_tasks(store)
-    for task in interrupted:
-        logger.warning(
-            "Task %s (%s) — will resume at '%s'",
-            task.task_id,
-            task.description[:50],
-            task.next_action,
-        )
+    if interrupted:
+        logger.info("Recovered %d interrupted task(s)", len(interrupted))
+
+    # Clean up expired chats
+    for session in chat_store.list_sessions():
+        if session.is_expired(config.defaults.chat_inactivity_timeout):
+            chat_store.delete(session.session_id)
+            logger.info("Cleaned up expired chat session %s", session.session_id)
 
     # Build Telegram app
-    app = create_application(config, event_bus)
-    app.bot_data["store"] = store
-    app.bot_data["session_manager"] = session_mgr
+    app = create_application(config, event_bus, store, session_mgr)
 
-    # V2: TelegramEventHandler wiring deferred to Task 16
-    # telegram_handler = TelegramEventHandler(
-    #     app.bot, event_bus, group_chat_id=config.telegram.group_id,
-    # )
+    # Wire event handler
+    handler = TelegramEventHandler(app.bot, event_bus)
 
     # Shutdown event
     shutdown_event = asyncio.Event()
@@ -108,13 +109,12 @@ async def run(config_path: Path | None = None) -> None:
         logger.info("Shutdown requested")
         shutdown_event.set()
 
-    # Register signal handlers
     loop = asyncio.get_running_loop()
     if sys.platform != "win32":
         loop.add_signal_handler(signal.SIGINT, request_shutdown)
         loop.add_signal_handler(signal.SIGTERM, request_shutdown)
 
-    logger.info("CortexBot starting polling...")
+    logger.info("CortexBot V2 starting polling...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(
@@ -122,7 +122,6 @@ async def run(config_path: Path | None = None) -> None:
         drop_pending_updates=True,
     )
 
-    # Wait for shutdown signal
     try:
         await shutdown_event.wait()
     except (asyncio.CancelledError, KeyboardInterrupt):
@@ -130,11 +129,9 @@ async def run(config_path: Path | None = None) -> None:
     finally:
         logger.info("CortexBot shutting down...")
 
-        # Kill any running subprocess
         if session_mgr.current_pid:
             session_mgr.kill_subprocess()
 
-        # Save interrupted tasks on shutdown
         for task in store.list_tasks():
             if task.status == "active" and task.subprocess_pid is not None:
                 task.subprocess_pid = None
