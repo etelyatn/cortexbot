@@ -1,4 +1,4 @@
-"""Post event bus notifications to Telegram threads."""
+"""Post event bus notifications to Telegram."""
 
 from __future__ import annotations
 
@@ -13,75 +13,56 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramEventHandler:
-    """Subscribes to event bus and posts notifications to Telegram threads."""
+    """Subscribes to event bus and posts notifications to Telegram."""
 
-    def __init__(self, bot: Bot, event_bus: EventBus, group_chat_id: int | None = None) -> None:
+    def __init__(self, bot: Bot, event_bus: EventBus | None = None) -> None:
         self._bot = bot
         self._bus = event_bus
-        self._group_chat_id = group_chat_id
-        self._register()
+        if event_bus:
+            self._register()
 
     def _register(self) -> None:
-        """Subscribe to all relevant events."""
         events = [
-            "task.created",
-            "task.completed",
-            "phase.started",
-            "phase.completed",
-            "phase.failed",
-            "phase.skipped",
-            "phase.cancelled",
-            "escalation.needed",
-            "budget.warning",
-            "budget.exhausted",
-            "progress.update",
+            "task.created", "task.completed",
+            "session.started", "session.completed",
+            "chat.started", "chat.ended",
         ]
         for event in events:
             self._bus.subscribe(event, self._handle_event)
 
     async def _handle_event(self, payload: dict[str, Any]) -> None:
-        """Format and send event notification to the relevant thread."""
+        chat_id = payload.get("chat_id")
         thread_id = payload.get("thread_id")
-        if not thread_id:
-            logger.warning("Event missing thread_id: %s", payload)
+        if not chat_id:
             return
 
         message = self._format_event(payload)
         if message:
             try:
-                # Use group_chat_id if available, thread_id as message_thread_id
-                chat_id = self._group_chat_id or thread_id
-                kwargs: dict[str, Any] = {
-                    "chat_id": chat_id,
-                    "text": message,
-                    "parse_mode": "Markdown",
-                }
-                if self._group_chat_id and thread_id != chat_id:
+                kwargs = {"chat_id": chat_id, "text": message}
+                if thread_id:
                     kwargs["message_thread_id"] = thread_id
                 await self._bot.send_message(**kwargs)
             except Exception as e:
-                logger.error("Failed to send Telegram notification: %s", e)
+                logger.error("Failed to send notification: %s", e)
+
+    async def on_task_created(self, payload: dict[str, Any]) -> None:
+        """Handle task.created event directly."""
+        await self._handle_event({**payload, "event_type": "task.created"})
+
+    async def on_session_completed(self, payload: dict[str, Any]) -> None:
+        """Handle session.completed event directly."""
+        await self._handle_event({**payload, "event_type": "session.completed"})
 
     def _format_event(self, payload: dict[str, Any]) -> str | None:
-        """Format an event payload into a human-readable message."""
         event_type = payload.get("event_type", "")
-
         formatters = {
-            "task.created": lambda p: f"Task created: **{p.get('title')}**\nProject: {p.get('project')}\nAutonomy: {p.get('autonomy', 'supervised')}",
-            "task.completed": lambda p: f"Task completed: **{p.get('title')}**\n{p.get('summary', '')}",
-            "phase.started": lambda p: f"Phase **{p.get('phase')}** started.",
-            "phase.completed": lambda p: f"Phase **{p.get('phase')}** completed.\n{p.get('summary', '')}",
-            "phase.failed": lambda p: f"Phase **{p.get('phase')}** failed: {p.get('error', 'unknown')}" + ("\nWill retry." if p.get("will_retry") else "\nEscalating."),
-            "phase.skipped": lambda p: f"Phase **{p.get('phase')}** skipped.",
-            "phase.cancelled": lambda p: f"Phase **{p.get('phase')}** cancelled.\nReply /retry to re-run or /skip to move on.",
-            "escalation.needed": lambda p: f"Escalation needed ({p.get('phase')}): {p.get('reason', 'unknown')}",
-            "budget.warning": lambda p: f"Budget warning: ${p.get('remaining_usd', 0):.2f} remaining.",
-            "budget.exhausted": lambda p: f"Budget exhausted (${p.get('spent_usd', 0):.2f} spent). Reply /budget <amount> to add more.",
-            "progress.update": lambda p: p.get("status_text", ""),
+            "task.created": lambda p: f"Task created: {p.get('description', '')}",
+            "task.completed": lambda p: f"Task completed: {p.get('description', '')}",
+            "session.started": lambda p: f"Running: {p.get('action', '')}",
+            "session.completed": lambda p: f"Action `{p.get('action', '')}` {p.get('exit_reason', 'done')}",
+            "chat.started": lambda p: f"Chat session started",
+            "chat.ended": lambda p: f"Chat session ended ({p.get('message_count', 0)} messages)",
         }
-
         formatter = formatters.get(event_type)
-        if formatter:
-            return formatter(payload)
-
-        return None
+        return formatter(payload) if formatter else None
