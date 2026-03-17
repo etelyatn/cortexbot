@@ -96,6 +96,20 @@ class TestParseStreamLine:
         event = parse_stream_line(line)
         assert event.counts_for_rotation is False
 
+    def test_result_event_token_extraction(self) -> None:
+        """StreamEvent provides input_tokens and output_tokens from usage."""
+        line = '{"type":"result","cost_usd":0.42,"duration_ms":5000,"usage":{"input_tokens":1500,"output_tokens":800}}'
+        event = parse_stream_line(line)
+        assert event.input_tokens == 1500
+        assert event.output_tokens == 800
+
+    def test_result_event_no_usage(self) -> None:
+        """StreamEvent returns 0 tokens when no usage present."""
+        line = '{"type":"result","cost_usd":0.1}'
+        event = parse_stream_line(line)
+        assert event.input_tokens == 0
+        assert event.output_tokens == 0
+
 
 class TestStatusBlock:
     """Test detection of phase completion status blocks."""
