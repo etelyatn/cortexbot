@@ -1,25 +1,21 @@
-"""Tests for session rotation logic."""
-
-import pytest
-
 from cortexbot.memory.session_rotation import should_rotate
 
 
-class TestShouldRotate:
-    """Test session rotation threshold checks."""
+def test_execute_rotation():
+    assert should_rotate("execute", 100) is True
+    assert should_rotate("execute", 99) is False
 
-    def test_below_threshold_no_rotate(self) -> None:
-        assert should_rotate("design", event_count=30, thresholds={"design": 50}) is False
 
-    def test_at_threshold_rotates(self) -> None:
-        assert should_rotate("design", event_count=50, thresholds={"design": 50}) is True
+def test_implement_rotation():
+    assert should_rotate("implement", 100) is True
 
-    def test_above_threshold_rotates(self) -> None:
-        assert should_rotate("implement", event_count=120, thresholds={"implement": 100}) is True
 
-    def test_missing_threshold_uses_default(self) -> None:
-        """Phases without explicit threshold use 50 as default."""
-        assert should_rotate("unknown_phase", event_count=60, thresholds={}) is True
+def test_non_execute_never_rotates():
+    assert should_rotate("brainstorm", 200) is False
+    assert should_rotate("plan", 200) is False
+    assert should_rotate("review", 200) is False
 
-    def test_zero_events_no_rotate(self) -> None:
-        assert should_rotate("design", event_count=0, thresholds={"design": 50}) is False
+
+def test_fix_actions_rotate():
+    assert should_rotate("fix-review", 100) is True
+    assert should_rotate("fix-tests", 100) is True
