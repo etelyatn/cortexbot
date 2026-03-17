@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class TaskStore:
     """Persist TaskState as JSON files with atomic writes.
 
-    Files stored at {base_dir}/tasks/{thread_id}.json.
+    Files stored at {base_dir}/tasks/{task_id}.json.
     Atomic writes: write to .tmp, then os.replace.
     """
 
@@ -26,23 +26,19 @@ class TaskStore:
         """Save task state atomically."""
         self._tasks_dir.mkdir(parents=True, exist_ok=True)
 
-        target = self._tasks_dir / f"{task.thread_id}.json"
-        tmp = self._tasks_dir / f"{task.thread_id}.json.tmp"
+        target = self._tasks_dir / f"{task.task_id}.json"
+        tmp = self._tasks_dir / f"{task.task_id}.json.tmp"
 
         data = json.dumps(task.to_dict(), indent=2)
         tmp.write_text(data, encoding="utf-8")
         os.replace(str(tmp), str(target))
 
-        logger.debug("Saved task %d to %s", task.thread_id, target)
+        logger.debug("Saved task %s to %s", task.task_id, target)
 
-    def load_task(self, thread_id: int) -> TaskState | None:
-        """Load task state from disk.
-
-        Returns None if file doesn't exist. Falls back to .tmp if
-        main file is corrupt.
-        """
-        target = self._tasks_dir / f"{thread_id}.json"
-        tmp = self._tasks_dir / f"{thread_id}.json.tmp"
+    def load_task(self, task_id: str) -> TaskState | None:
+        """Load task state from disk."""
+        target = self._tasks_dir / f"{task_id}.json"
+        tmp = self._tasks_dir / f"{task_id}.json.tmp"
 
         for path in (target, tmp):
             if path.exists():
@@ -69,9 +65,9 @@ class TaskStore:
                 logger.warning("Skipping corrupt task file %s: %s", path, e)
         return tasks
 
-    def delete_task(self, thread_id: int) -> None:
+    def delete_task(self, task_id: str) -> None:
         """Delete task state file."""
-        target = self._tasks_dir / f"{thread_id}.json"
+        target = self._tasks_dir / f"{task_id}.json"
         if target.exists():
             target.unlink()
-            logger.debug("Deleted task %d", thread_id)
+            logger.debug("Deleted task %s", task_id)
