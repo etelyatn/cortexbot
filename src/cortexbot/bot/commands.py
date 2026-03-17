@@ -17,21 +17,12 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from cortexbot.claude.cli import build_invocation, run_claude
-from cortexbot.claude.prompt_builder import load_template, build_prompt
 from cortexbot.claude.stream_parser import parse_stream_line, StatusBlock
 from cortexbot.config import BotConfig
 from cortexbot.events.bus import EventBus
 from cortexbot.health.preflight import check_editor_alive, check_git_branch
 from cortexbot.log import InvocationLogger
-from cortexbot.memory.artifacts import extract_artifacts_from_status
 from cortexbot.memory.store import TaskStore
-from cortexbot.orchestrator.autonomy import (
-    AutonomyDecision,
-    decide_on_error,
-    decide_on_phase_complete,
-    should_auto_advance,
-)
-from cortexbot.orchestrator.phase_gates import validate_gate
 from cortexbot.orchestrator.phase_tools import get_allowed_tools
 from cortexbot.orchestrator.session_manager import SessionManager
 from cortexbot.orchestrator.task_manager import TaskState, PhaseRecord, next_phase, PHASES
